@@ -21,9 +21,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config import PROCESSED_DIR
+from src.config import PROCESSED_DIR, MODELS_DIR
 from src.pipeline.features import split_temporal_tvt, FEATURES_VERSION
 from src.models.lstm_autoencoder import AnomalyDetector
+from src.models.metadata import save_model_metadata
 
 
 def main():
@@ -104,12 +105,13 @@ def main():
     val_errors = lstm_model.compute_reconstruction_error(X_val_seq)
     lstm_model.set_threshold(val_errors, percentile=95.0)
 
+    lstm_val_metrics = {"best_val_loss": float(min(lstm_model.val_losses_) if lstm_model.val_losses_ else 0.0)}
     if len(X_fail_seq) > 0 and len(X_health_test_seq) > 0:
         fail_errors = lstm_model.compute_reconstruction_error(X_fail_seq)
         health_errors = lstm_model.compute_reconstruction_error(X_health_test_seq)
         fail_preds = (fail_errors > lstm_model.threshold_).astype(int)
         health_preds = (health_errors > lstm_model.threshold_).astype(int)
-        sep = fail_errors.mean() / max(health_errors.mean(), 1e-10)
+        sep = float(fail_errors.mean() / max(health_errors.mean(), 1e-10))
 
         print()
         print("LSTM-AE Test Results (val-calibrated threshold):")
@@ -121,7 +123,39 @@ def main():
         print(f"  Mean error (failure): {fail_errors.mean():.6f}")
         print(f"  Separation ratio:     {sep:.2f}x")
 
+        lstm_val_metrics.update({
+            "test_healthy_far": float(health_preds.mean()),
+            "test_failure_detection_rate": float(fail_preds.mean()),
+            "test_mean_error_healthy": float(health_errors.mean()),
+            "test_mean_error_failure": float(fail_errors.mean()),
+            "test_separation_ratio": sep,
+        })
+
     lstm_model.save()
+    save_model_metadata(
+        model_path=MODELS_DIR / "lstm_ae.pt",
+        model_type="lstm_autoencoder",
+        n_train_rows=len(X_train_seq),
+        n_val_rows=len(X_val_seq),
+        n_test_rows=(len(X_fail_seq) + len(X_health_test_seq)) if len(X_fail_seq) > 0 else 0,
+        val_metrics=lstm_val_metrics,
+        feature_names=lstm_model.feature_names_,
+        training_config={
+            "input_dim": 6,
+            "seq_len": 60,
+            "hidden_dim": 64,
+            "latent_dim": 32,
+            "n_layers": 2,
+            "n_epochs": 30,
+            "batch_size": 256,
+            "early_stopping_patience": 4,
+            "threshold_percentile": 95.0,
+            "threshold_value": float(lstm_model.threshold_) if lstm_model.threshold_ else 0.0,
+            "device": lstm_model.device,
+            "trainer": "scripts/train_lstm_only.py (standalone)",
+        },
+        extra={"features_version": FEATURES_VERSION},
+    )
     print(f"\nDone in {time.time()-total_start:.1f}s")
 
 

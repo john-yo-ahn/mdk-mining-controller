@@ -34,5 +34,10 @@ data/models/*
 !data/processed/.gitkeep
 !data/models/.gitkeep
 
+# Also track the small JSON metadata sidecars for committed models
+# so reviewers can see training config / metrics / git commit
+# without rerunning the pipeline. Sidecars are < 2 KB each.
+!data/models/*.metadata.json
+
 # Claude Code local state
 .claude/settings.local.json

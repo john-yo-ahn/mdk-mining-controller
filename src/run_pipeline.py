@@ -229,8 +229,33 @@ def main():
     print(f"    TN={cm[0][0]:,}  FP={cm[0][1]:,}")
     print(f"    FN={cm[1][0]:,}  TP={cm[1][1]:,}")
 
-    # Save model
+    # Save model + metadata sidecar
     xgb_model.save()
+    from .models.metadata import save_model_metadata
+    save_model_metadata(
+        model_path=MODELS_DIR / "xgboost_failure.joblib",
+        model_type="xgboost_binary",
+        n_train_rows=len(X_train),
+        n_val_rows=len(X_val),
+        n_test_rows=len(X_test),
+        val_metrics=xgb_metrics,
+        feature_names=feature_cols,
+        training_config={
+            "n_estimators": 400,
+            "max_depth": 6,
+            "learning_rate": 0.05,
+            "tree_method": "hist",
+            "scale_pos_weight": "sqrt-capped",
+            "threshold_strategy": "f1_with_floor",
+            "threshold_value": float(xgb_model.threshold_),
+            "split": "split_temporal_tvt(0.55, 0.15)",
+        },
+        extra={
+            "features_version": FEATURES_VERSION,
+            "test_failures_detected": int(timeline["detected"].sum()) if len(timeline) else 0,
+            "test_failures_total": int(len(timeline)),
+        },
+    )
 
     # ── Step 8: Train LSTM-Autoencoder ──────────────────────────────
     print("\n" + "=" * 70)
@@ -285,9 +310,14 @@ def main():
 
         # Final evaluation on test data. These numbers are honest:
         # neither the weights nor the threshold ever saw these rows.
+        lstm_val_metrics = {"best_val_loss": float(min(lstm_model.val_losses_) if lstm_model.val_losses_ else 0.0)}
+        lstm_n_test = 0
+        X_fail_seq = None
+        X_health_test_seq = None
         if len(failure_test) > 0:
             X_fail_seq = lstm_model.prepare_sequences(failure_test, stride=5)
             X_health_test_seq = lstm_model.prepare_sequences(healthy_test, stride=5)
+            lstm_n_test = len(X_fail_seq) + len(X_health_test_seq)
 
             if len(X_fail_seq) > 0 and len(X_health_test_seq) > 0:
                 fail_errors = lstm_model.compute_reconstruction_error(X_fail_seq)
@@ -295,6 +325,7 @@ def main():
 
                 fail_preds = (fail_errors > lstm_model.threshold_).astype(int)
                 health_preds = (health_errors > lstm_model.threshold_).astype(int)
+                sep = float(fail_errors.mean() / max(health_errors.mean(), 1e-10))
 
                 print(f"\n  LSTM-AE Test Results (val-calibrated threshold):")
                 print(f"    Healthy sequences flagged:  {health_preds.sum()}/{len(health_preds)} "
@@ -303,9 +334,40 @@ def main():
                       f"({fail_preds.mean():.1%})")
                 print(f"    Mean error (healthy): {health_errors.mean():.6f}")
                 print(f"    Mean error (failure): {fail_errors.mean():.6f}")
-                print(f"    Separation ratio:     {fail_errors.mean() / max(health_errors.mean(), 1e-10):.2f}x")
+                print(f"    Separation ratio:     {sep:.2f}x")
+
+                lstm_val_metrics.update({
+                    "test_healthy_far": float(health_preds.mean()),
+                    "test_failure_detection_rate": float(fail_preds.mean()),
+                    "test_mean_error_healthy": float(health_errors.mean()),
+                    "test_mean_error_failure": float(fail_errors.mean()),
+                    "test_separation_ratio": sep,
+                })
 
         lstm_model.save()
+        save_model_metadata(
+            model_path=MODELS_DIR / "lstm_ae.pt",
+            model_type="lstm_autoencoder",
+            n_train_rows=len(X_train_seq),
+            n_val_rows=len(X_val_seq),
+            n_test_rows=lstm_n_test,
+            val_metrics=lstm_val_metrics,
+            feature_names=lstm_model.feature_names_,
+            training_config={
+                "input_dim": 6,
+                "seq_len": 60,
+                "hidden_dim": 64,
+                "latent_dim": 32,
+                "n_layers": 2,
+                "n_epochs": 30,
+                "batch_size": 256,
+                "early_stopping_patience": 4,
+                "threshold_percentile": 95.0,
+                "threshold_value": float(lstm_model.threshold_) if lstm_model.threshold_ else 0.0,
+                "device": lstm_model.device,
+            },
+            extra={"features_version": FEATURES_VERSION},
+        )
     else:
         print("  Not enough healthy sequences to train. Skipping LSTM-AE.")
 

@@ -1,0 +1,34 @@
+{
+  "extra": {
+    "features_version": 2,
+    "note": "backfilled from committed model; training run was commit fbb9f73"
+  },
+  "feature_count": 6,
+  "feature_names_hash": "cfabaf18eb30e494",
+  "git_commit": "fbb9f73020bf87ed615b51f6ae582d3f9caf7bc4",
+  "git_dirty": true,
+  "model_file": "lstm_ae.pt",
+  "model_type": "lstm_autoencoder",
+  "n_test_rows": 237131,
+  "n_train_rows": 0,
+  "n_val_rows": 0,
+  "schema_version": 1,
+  "training_config": {
+    "device": "mps",
+    "hidden_dim": 64,
+    "input_dim": 6,
+    "latent_dim": 32,
+    "n_layers": 2,
+    "seq_len": 60,
+    "threshold_percentile": 95.0,
+    "threshold_value": 0.00753234392032027
+  },
+  "training_date_utc": "2026-04-08T10:10:25.824748+00:00",
+  "val_metrics": {
+    "test_failure_detection_rate": 0.9981780605862838,
+    "test_healthy_far": 0.9960919758231557,
+    "test_mean_error_failure": 0.19347278773784637,
+    "test_mean_error_healthy": 0.3441607654094696,
+    "test_separation_ratio": 0.5621581673622131
+  }
+}
