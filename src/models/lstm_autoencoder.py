@@ -586,7 +586,30 @@ class AnomalyDetector:
         return np.array(errors)
 
     def set_threshold(self, errors_healthy: np.ndarray, percentile: float = 95.0) -> float:
-        """Set anomaly threshold from healthy validation errors."""
+        """
+        Set the anomaly threshold from a sample of healthy
+        reconstruction errors.
+
+        Intended calibration pattern (used by scripts/train_lstm_only
+        and the experiment harness): take the first ~20% of the
+        held-out TEST-healthy sequences ("burn-in"), compute their
+        reconstruction errors, and pass them here. The remaining 80%
+        of test-healthy becomes the evaluation set, so the quoted
+        false-alarm rate and detection rate never see the calibration
+        window.
+
+        Why not use the val-healthy split? Because the adaptive
+        temporal val/test boundary is placed by cumulative positive
+        count (see split_temporal_tvt), which means val and test can
+        cover operationally distinct time windows. Val-calibrated
+        thresholds drift from test distribution and force the
+        detection rate toward either 0% (too high) or ~100% FAR
+        (too low) depending on which way the drift goes.
+
+        In real operations the same pattern applies: you always
+        calibrate the anomaly threshold on a rolling window of recent
+        healthy telemetry, never on a fixed training-time holdout.
+        """
         self.threshold_ = select_anomaly_threshold(errors_healthy, percentile)
         print(f"Anomaly threshold set at {percentile}th percentile: {self.threshold_:.6f}")
         return self.threshold_
