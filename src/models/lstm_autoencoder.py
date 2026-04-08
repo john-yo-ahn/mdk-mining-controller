@@ -4,7 +4,7 @@ Trained on healthy-only data. Reconstruction error = anomaly score.
 """
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -100,10 +100,22 @@ class AnomalyDetector:
         # Persistent per-feature normalization. Fit once on training
         # data; used identically at training, validation, and inference
         # so reconstruction errors are comparable across calls.
-        # feature_names_ is the ordered column list used to build sequences.
+        #
+        # Scaler layout (schema v2): one (mean, std) pair per hardware
+        # model, looked up by the `model` column on the input DataFrame.
+        # Each hardware family (Antminer S21 Pro, Whatsminer M56S, etc.)
+        # has a very different healthy operating envelope — mixing them
+        # into a single global scaler smears the manifold and prevents
+        # the autoencoder from tightening on any of them. A per-model
+        # scaler tightens each family independently.
+        #
+        # global_fallback_* is used when inference encounters a hardware
+        # model that did not appear at training time, with a clearly
+        # logged warning.
         self.feature_names_: Optional[List[str]] = None
-        self.feature_mean_: Optional[np.ndarray] = None   # shape (n_features,)
-        self.feature_std_: Optional[np.ndarray] = None    # shape (n_features,)
+        self.feature_scalers_: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self.global_fallback_mean_: Optional[np.ndarray] = None
+        self.global_fallback_std_: Optional[np.ndarray] = None
 
         if not HAS_TORCH:
             print("WARNING: PyTorch not installed. LSTM-AE will not be available.")
@@ -131,35 +143,143 @@ class AnomalyDetector:
             input_dim, hidden_dim, latent_dim, n_layers, seq_len,
         ).to(self.device)
 
+    # Backward-compat properties: the v1 scaler exposed `feature_mean_`
+    # and `feature_std_` as flat numpy arrays. Under schema v2 those are
+    # replaced by a per-hardware-model dict. Any code still reading the
+    # old attributes must be updated to call lookup_scaler(model_name).
+    # Raise loudly rather than returning a silently-wrong value.
+    @property
+    def feature_mean_(self) -> np.ndarray:
+        raise AttributeError(
+            "AnomalyDetector.feature_mean_ was removed in scaler schema v2. "
+            "Use lookup_scaler(model_name)[0] for a per-hardware scaler, "
+            "or global_fallback_mean_ for the unknown-model fallback."
+        )
+
+    @property
+    def feature_std_(self) -> np.ndarray:
+        raise AttributeError(
+            "AnomalyDetector.feature_std_ was removed in scaler schema v2. "
+            "Use lookup_scaler(model_name)[1] for a per-hardware scaler, "
+            "or global_fallback_std_ for the unknown-model fallback."
+        )
+
+    @staticmethod
+    def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
+        """
+        The synthetic generator writes the hardware family as the
+        trailing token of the full spec name: ``"Antminer S21 Pro"``
+        becomes ``"Pro"`` in the ``model`` column of the DataFrame.
+        Callers (e.g. AIBridge.register_miner) may pass either the
+        full spec name or the short token; normalize to the short
+        token here so scaler lookups succeed either way.
+        """
+        if model_name is None:
+            return None
+        parts = str(model_name).split()
+        return parts[-1] if len(parts) > 1 else str(model_name)
+
+    def lookup_scaler(
+        self, model_name: Optional[str]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (mean, std) for the given hardware model, falling back
+        to the global scaler if the model is unknown or not provided.
+        Accepts either the short token (``"Pro"``) or the full spec
+        name (``"Antminer S21 Pro"``) — both map to the same entry.
+        One lookup per miner (not per timestep) is the expected call
+        frequency, so the dict lookup is fine as-is.
+        """
+        key = self._normalize_model_name(model_name)
+        if key is not None and key in self.feature_scalers_:
+            return self.feature_scalers_[key]
+        if self.global_fallback_mean_ is None or self.global_fallback_std_ is None:
+            raise RuntimeError(
+                "LSTM scaler has not been fitted yet. Call fit_scaler() "
+                "on training data first."
+            )
+        return self.global_fallback_mean_, self.global_fallback_std_
+
+    # Minimum distinct miners per hardware model required to fit a
+    # dedicated per-model scaler. Below this threshold the fleet for
+    # that model is too small for the per-model mean/std to be stable
+    # (one failing miner could dominate), so we fall back to the
+    # global scaler for that family.
+    MIN_MINERS_PER_MODEL_SCALER = 3
+
     def fit_scaler(
         self,
         df: pd.DataFrame,
         feature_columns: Optional[List[str]] = None,
     ) -> None:
         """
-        Fit GLOBAL per-feature mean/std on a healthy DataFrame.
+        Fit per-hardware-model and global fallback scalers on a healthy
+        DataFrame.
 
         Call this once on the training data BEFORE prepare_sequences. The
-        stats are then persisted on the model and reused for every later
-        prepare_sequences call — training, validation, and inference — so
-        reconstruction errors are comparable across all of them.
+        stats are then persisted on the model and reused at training,
+        validation, and inference time so reconstruction errors are
+        comparable across all of them.
 
-        The previous implementation recomputed mean/std per-miner per-call,
-        meaning a model trained on 90 days of stable data would see very
-        different scales at inference time (where only a short rolling
-        buffer is available) and the threshold became meaningless.
+        Schema v2 change: instead of a single global mean/std pair the
+        scaler is a dict keyed on hardware model (the `model` column
+        on the input DataFrame). Each family's mean and std are
+        computed separately, which tightens the healthy manifold for
+        each family and unblocks useful reconstruction-error signals.
+        Falls back to a global mean/std for any hardware model that
+        has fewer than MIN_MINERS_PER_MODEL_SCALER distinct miners in
+        training (the per-model stats are too noisy below that cutoff).
+
+        The previous schema v1 used a single flat mean/std on all
+        training rows, which in production smeared four hardware
+        families together and gave the AE nothing to overfit cleanly.
         """
         if feature_columns is None:
             feature_columns = [c for c in self.DEFAULT_FEATURES if c in df.columns]
         self.feature_names_ = list(feature_columns)
-        values = df[feature_columns].to_numpy(dtype=np.float32)
-        self.feature_mean_ = values.mean(axis=0)
-        std = values.std(axis=0)
-        std[std == 0] = 1.0  # avoid div-by-zero for constant columns
-        self.feature_std_ = std
+
+        all_values = df[feature_columns].to_numpy(dtype=np.float32)
+        gf_mean = all_values.mean(axis=0)
+        gf_std = all_values.std(axis=0)
+        gf_std[gf_std == 0] = 1.0
+        self.global_fallback_mean_ = gf_mean
+        self.global_fallback_std_ = gf_std
+
+        if "model" not in df.columns:
+            raise ValueError(
+                "fit_scaler expects a 'model' column on the training "
+                "DataFrame so it can fit per-hardware-model scalers. "
+                "Got columns: " + ", ".join(df.columns[:10]) + "..."
+            )
+
+        self.feature_scalers_ = {}
+        model_miner_counts = df.groupby("model")["miner_id"].nunique()
+        total_rows = len(all_values)
         print(
-            f"  Fitted LSTM-AE scaler on {len(values):,} rows × "
-            f"{len(feature_columns)} features"
+            f"  Fitting LSTM-AE scaler (schema v2) on "
+            f"{total_rows:,} rows × {len(feature_columns)} features"
+        )
+        for model_name, grp in df.groupby("model"):
+            n_miners = int(model_miner_counts[model_name])
+            if n_miners < self.MIN_MINERS_PER_MODEL_SCALER:
+                print(
+                    f"    {model_name!s}: {len(grp):,} rows, {n_miners} miners "
+                    f"— below min {self.MIN_MINERS_PER_MODEL_SCALER}, using "
+                    f"global fallback"
+                )
+                continue
+            v = grp[feature_columns].to_numpy(dtype=np.float32)
+            m = v.mean(axis=0)
+            s = v.std(axis=0)
+            s[s == 0] = 1.0
+            self.feature_scalers_[str(model_name)] = (m, s)
+            print(
+                f"    {model_name!s}: {len(grp):,} rows, {n_miners} miners "
+                f"— per-model scaler fitted"
+            )
+        print(
+            f"  Global fallback: mean/std computed on all "
+            f"{total_rows:,} training rows"
         )
 
     def prepare_sequences(
@@ -171,10 +291,13 @@ class AnomalyDetector:
         """
         Convert DataFrame to sliding-window sequences.
         Groups by miner_id so no window ever spans two devices.
-        Applies the persistent scaler fitted by fit_scaler(). If the
-        scaler has not been fitted yet, one is fitted here on this df
-        as a convenience — but callers should prefer explicit fit_scaler
-        on the training set first.
+        Applies the per-hardware-model scaler fitted by fit_scaler():
+        each miner's sequences are normalized using the mean/std of
+        the hardware family that miner belongs to, falling back to the
+        global scaler for unknown families.
+        If the scaler has not been fitted yet, one is fitted here on
+        this df as a convenience — but callers should prefer explicit
+        fit_scaler on the training set first.
         Returns shape (n_sequences, seq_len, n_features).
         """
         if feature_columns is None:
@@ -183,7 +306,7 @@ class AnomalyDetector:
                 or [c for c in self.DEFAULT_FEATURES if c in df.columns]
             )
 
-        if self.feature_mean_ is None:
+        if not self.feature_scalers_ and self.global_fallback_mean_ is None:
             self.fit_scaler(df, feature_columns)
 
         if feature_columns != self.feature_names_:
@@ -192,11 +315,21 @@ class AnomalyDetector:
                 f"scaler was fitted on ({self.feature_names_})"
             )
 
-        mean = self.feature_mean_
-        std = self.feature_std_
+        has_model_col = "model" in df.columns
+        if not has_model_col:
+            print(
+                "  prepare_sequences: DataFrame has no 'model' column, "
+                "falling back to global scaler for all miners"
+            )
+
         sequences = []
         for miner_id in df["miner_id"].unique():
             miner_df = df[df["miner_id"] == miner_id].sort_values("timestamp")
+            if has_model_col:
+                model_name = str(miner_df["model"].iloc[0])
+            else:
+                model_name = None
+            mean, std = self.lookup_scaler(model_name)
             values = miner_df[feature_columns].to_numpy(dtype=np.float32)
             values = (values - mean) / std
             for i in range(0, len(values) - self.seq_len, stride):
@@ -398,12 +531,29 @@ class AnomalyDetector:
                         "latent_dim": self.latent_dim,
                         "n_layers": self.n_layers,
                     },
-                    # Persist the scaler alongside the weights so inference
-                    # reproduces exactly the same feature scales as training.
+                    # Persist the per-model scalers alongside the weights
+                    # so inference reproduces exactly the same feature
+                    # scales as training. Schema v2 — one (mean, std) pair
+                    # per hardware model + a global fallback, up from the
+                    # single-global pair in v1. load() refuses a v1
+                    # scaler (no "schema" key) with a clear error.
                     "scaler": {
+                        "schema": 2,
                         "feature_names": self.feature_names_,
-                        "mean": self.feature_mean_,
-                        "std": self.feature_std_,
+                        "global_mean": (
+                            self.global_fallback_mean_.tolist()
+                            if self.global_fallback_mean_ is not None
+                            else None
+                        ),
+                        "global_std": (
+                            self.global_fallback_std_.tolist()
+                            if self.global_fallback_std_ is not None
+                            else None
+                        ),
+                        "per_model": {
+                            name: {"mean": m.tolist(), "std": s.tolist()}
+                            for name, (m, s) in self.feature_scalers_.items()
+                        },
                     },
                 }, path)
             finally:
@@ -425,16 +575,40 @@ class AnomalyDetector:
         instance = cls(**cfg)
         instance.model_.load_state_dict(data["model_state"])
         instance.threshold_ = data["threshold"]
-        scaler = data.get("scaler")
-        if scaler is not None:
-            instance.feature_names_ = scaler.get("feature_names")
-            instance.feature_mean_ = scaler.get("mean")
-            instance.feature_std_ = scaler.get("std")
-        else:
-            print(
-                "  WARNING: loaded LSTM-AE has no persisted scaler. "
-                "Reconstruction errors may be miscalibrated until fit_scaler "
-                "is called on a representative healthy sample."
+        scaler = data.get("scaler") or {}
+        schema = scaler.get("schema", 1)
+        if schema == 1:
+            raise ValueError(
+                f"Model at {path} has a legacy v1 scaler (single global "
+                f"mean/std). Retrain with scripts/train_lstm_only.py to "
+                f"produce a v2 per-hardware-model scaler. The v1 layout "
+                f"is incompatible with the current inference path."
             )
-        print(f"Loaded LSTM-AE from {path}")
+        if schema != 2:
+            raise ValueError(
+                f"Unknown scaler schema {schema} in {path}. This "
+                f"AnomalyDetector only understands schema v2."
+            )
+        instance.feature_names_ = scaler.get("feature_names")
+        gf_mean = scaler.get("global_mean")
+        gf_std = scaler.get("global_std")
+        instance.global_fallback_mean_ = (
+            np.asarray(gf_mean, dtype=np.float32) if gf_mean is not None else None
+        )
+        instance.global_fallback_std_ = (
+            np.asarray(gf_std, dtype=np.float32) if gf_std is not None else None
+        )
+        per_model = scaler.get("per_model") or {}
+        instance.feature_scalers_ = {
+            name: (
+                np.asarray(entry["mean"], dtype=np.float32),
+                np.asarray(entry["std"], dtype=np.float32),
+            )
+            for name, entry in per_model.items()
+        }
+        print(
+            f"Loaded LSTM-AE from {path} "
+            f"(scaler v2: {len(instance.feature_scalers_)} per-model, "
+            f"global fallback present)"
+        )
         return instance

@@ -325,12 +325,21 @@ class AIBridge:
                 from ..models.lstm_autoencoder import AnomalyDetector
                 self.lstm_model = AnomalyDetector.load(lstm_path)
                 print(f"  Loaded LSTM-AE (threshold={self.lstm_model.threshold_:.6f})")
-                # Propagate the persistent scaler to any already-registered
-                # buffers so export_lstm_sequence uses the correct scale.
-                if self.lstm_model.feature_mean_ is not None:
+                # Propagate the per-hardware-model scaler to any
+                # already-registered buffers so export_lstm_sequence
+                # uses the correct scale for each miner's hardware
+                # family. Schema v2: AnomalyDetector.lookup_scaler()
+                # returns the right (mean, std) pair for the buffer's
+                # model, falling back to the global scaler for unknown
+                # families.
+                if (
+                    self.lstm_model.feature_scalers_
+                    or self.lstm_model.global_fallback_mean_ is not None
+                ):
                     for buf in self.buffers.values():
-                        buf.lstm_scaler_mean = self.lstm_model.feature_mean_
-                        buf.lstm_scaler_std = self.lstm_model.feature_std_
+                        mean, std = self.lstm_model.lookup_scaler(buf.model)
+                        buf.lstm_scaler_mean = mean
+                        buf.lstm_scaler_std = std
             except Exception as e:
                 print(f"  Failed to load LSTM-AE: {e}")
 
@@ -362,12 +371,22 @@ class AIBridge:
         """Register a miner's buffer."""
         if miner_id not in self.buffers:
             buf = MinerBuffer(miner_id, model, nameplate_hashrate)
-            # If the LSTM model is already loaded, propagate its persistent
-            # scaler so this new buffer normalizes sequences the same way
-            # the model was trained.
-            if self.lstm_model is not None and self.lstm_model.feature_mean_ is not None:
-                buf.lstm_scaler_mean = self.lstm_model.feature_mean_
-                buf.lstm_scaler_std = self.lstm_model.feature_std_
+            # If the LSTM model is already loaded, propagate its
+            # per-hardware-model scaler so this new buffer normalizes
+            # sequences the same way the model was trained.
+            # lookup_scaler accepts either "Antminer S21 Pro" or "Pro"
+            # and will fall back to the global scaler for unknown
+            # families.
+            if (
+                self.lstm_model is not None
+                and (
+                    self.lstm_model.feature_scalers_
+                    or self.lstm_model.global_fallback_mean_ is not None
+                )
+            ):
+                mean, std = self.lstm_model.lookup_scaler(model)
+                buf.lstm_scaler_mean = mean
+                buf.lstm_scaler_std = std
             self.buffers[miner_id] = buf
 
     def push_telemetry(
