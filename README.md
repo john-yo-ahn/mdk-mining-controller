@@ -56,6 +56,34 @@ uv run python -m src.run_pipeline
 uv run python -m src.validate
 ```
 
+## Reading order (for reviewers)
+
+If you have 5 minutes, read these in this order:
+
+1. **`docs/TECHNICAL_REPORT.md`** — the 2-4 page report covering
+   problem framing, approach, KPI design, results, and safety.
+2. **`docs/ARCHITECTURE.md`** — three mermaid diagrams showing the
+   dataflow, the two-model rationale, and the safety control loop.
+3. **`notebooks/01_eda.executed.ipynb`** — pre-rendered EDA with
+   plots. Shows the synthetic data is physics-plausible and the
+   label fix is verified inline.
+4. **`notebooks/02_results.executed.ipynb`** — pre-rendered results
+   notebook with ROC curves, per-failure-type tables, top features.
+5. **`docs/REMAINING_FIXES.md`** — 14-item followup queue prioritized
+   P0-P3, for understanding what was intentionally deferred.
+
+If you have an hour, also:
+
+6. Run `uv sync && uv run python -m src.run_pipeline` (~50 min,
+   reproduces all the numbers in the report) and then open the
+   notebooks live.
+7. Skim `src/models/xgboost_classifier.py`,
+   `src/models/lstm_autoencoder.py`, and
+   `src/pipeline/features.py:split_temporal_tvt` for the
+   correctness-critical code paths.
+8. Skim `src/optimizer/safety.py:SafetyGuard` for the hardware
+   safety layer.
+
 ## Project layout
 
 ```
