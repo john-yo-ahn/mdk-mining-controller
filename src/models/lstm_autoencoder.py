@@ -280,27 +280,68 @@ class AnomalyDetector:
                 break
 
         if best_state is not None:
-            self.model_.load_state_dict(best_state)
+            # Rebuild the model from scratch on CPU, load the best
+            # state into it, then move it back to the target device.
+            # This sidesteps an observed PyTorch MPS issue where
+            # load_state_dict on a live MPS model left subtle graph
+            # state behind that caused save/reload to drift. Building
+            # a fresh nn.Module guarantees a clean parameter layout.
+            fresh = LSTMAutoencoder(
+                input_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                latent_dim=self.latent_dim,
+                n_layers=self.n_layers,
+                seq_len=self.seq_len,
+            )
+            fresh.load_state_dict(best_state)
+            self.model_ = fresh.to(self.device)
+            self.model_.eval()
             print(f"  Restored best weights (val_loss={best_val:.6f})")
 
         return self.train_losses_
 
     def compute_reconstruction_error(self, X: np.ndarray) -> np.ndarray:
-        """Per-sequence mean squared reconstruction error."""
+        """
+        Per-sequence mean squared reconstruction error.
+
+        Inference runs on CPU regardless of the training device. On Apple
+        Silicon MPS we observed a kernel bug where specific combinations
+        of batch size and this LSTM architecture return numerically wrong
+        outputs (sometimes off by an order of magnitude) while the same
+        model on CPU or with a different batch size is correct. The bug
+        is silent — no error, no warning, just wrong numbers — and it
+        used to make training-time separation metrics look great while
+        reload metrics looked terrible on the identical weights. Forcing
+        CPU here eliminates the risk entirely. The model is small enough
+        (~60k params) that CPU inference is not a bottleneck for the
+        dataset sizes we evaluate on.
+        """
         if not HAS_TORCH:
             return np.zeros(len(X))
 
         self.model_.eval()
-        errors = []
-        dataset = TensorDataset(torch.FloatTensor(X))
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        # Snapshot then move to CPU for inference; restore after.
+        was_on = next(self.model_.parameters()).device
+        needs_restore = str(was_on) != "cpu"
+        if needs_restore:
+            self.model_ = self.model_.to("cpu")
 
-        with torch.no_grad():
-            for (batch,) in loader:
-                batch = batch.to(self.device)
-                output = self.model_(batch)
-                mse = ((output - batch) ** 2).mean(dim=(1, 2))
-                errors.extend(mse.cpu().numpy())
+        errors = []
+        # Keep a safe CPU batch size that is not known to hit the MPS bug.
+        # On CPU the value only affects throughput, not correctness.
+        cpu_bs = min(max(self.batch_size, 1), 256)
+        dataset = TensorDataset(torch.FloatTensor(X))
+        loader = DataLoader(dataset, batch_size=cpu_bs, shuffle=False)
+
+        try:
+            with torch.no_grad():
+                for (batch,) in loader:
+                    output = self.model_(batch)
+                    mse = ((output - batch) ** 2).mean(dim=(1, 2))
+                    errors.extend(mse.numpy())
+        finally:
+            if needs_restore:
+                self.model_ = self.model_.to(was_on)
 
         return np.array(errors)
 
@@ -326,24 +367,40 @@ class AnomalyDetector:
             path = MODELS_DIR / "lstm_ae.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
         if HAS_TORCH and self.model_ is not None:
-            torch.save({
-                "model_state": self.model_.state_dict(),
-                "threshold": self.threshold_,
-                "config": {
-                    "input_dim": self.input_dim,
-                    "seq_len": self.seq_len,
-                    "hidden_dim": self.hidden_dim,
-                    "latent_dim": self.latent_dim,
-                    "n_layers": self.n_layers,
-                },
-                # Persist the scaler alongside the weights so inference
-                # reproduces exactly the same feature scales as training.
-                "scaler": {
-                    "feature_names": self.feature_names_,
-                    "mean": self.feature_mean_,
-                    "std": self.feature_std_,
-                },
-            }, path)
+            # Move to CPU before saving. This sidesteps a PyTorch MPS
+            # quirk where state_dict pulled off a long-trained MPS
+            # model can round-trip bit-exactly (weights equal, forward
+            # on a single input equal) but still produce subtly
+            # different reconstruction-error distributions when
+            # reloaded into a fresh MPS context. Copying to CPU first
+            # forces a synchronous parameter materialization and
+            # eliminates the drift.
+            self.model_.eval()
+            was_on = self.device
+            cpu_model = self.model_.to("cpu")
+            try:
+                torch.save({
+                    "model_state": cpu_model.state_dict(),
+                    "threshold": self.threshold_,
+                    "config": {
+                        "input_dim": self.input_dim,
+                        "seq_len": self.seq_len,
+                        "hidden_dim": self.hidden_dim,
+                        "latent_dim": self.latent_dim,
+                        "n_layers": self.n_layers,
+                    },
+                    # Persist the scaler alongside the weights so inference
+                    # reproduces exactly the same feature scales as training.
+                    "scaler": {
+                        "feature_names": self.feature_names_,
+                        "mean": self.feature_mean_,
+                        "std": self.feature_std_,
+                    },
+                }, path)
+            finally:
+                # Restore to original device so in-memory usage after
+                # save() still runs on MPS/CUDA.
+                self.model_ = cpu_model.to(was_on)
         print(f"Saved LSTM-AE to {path}")
         return path
 

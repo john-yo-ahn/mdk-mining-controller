@@ -1,34 +1,38 @@
 {
   "extra": {
-    "features_version": 2,
-    "note": "backfilled from committed model; training run was commit fbb9f73"
+    "features_version": 2
   },
   "feature_count": 6,
   "feature_names_hash": "cfabaf18eb30e494",
-  "git_commit": "fbb9f73020bf87ed615b51f6ae582d3f9caf7bc4",
+  "git_commit": "1b2eb2df6c0d1f5ad46c63cd10da5df58734bd3a",
   "git_dirty": true,
   "model_file": "lstm_ae.pt",
   "model_type": "lstm_autoencoder",
   "n_test_rows": 237131,
-  "n_train_rows": 0,
-  "n_val_rows": 0,
+  "n_train_rows": 649133,
+  "n_val_rows": 41429,
   "schema_version": 1,
   "training_config": {
+    "batch_size": 256,
     "device": "mps",
+    "early_stopping_patience": 4,
     "hidden_dim": 64,
     "input_dim": 6,
     "latent_dim": 32,
+    "n_epochs": 30,
     "n_layers": 2,
     "seq_len": 60,
     "threshold_percentile": 95.0,
-    "threshold_value": 0.00753234392032027
+    "threshold_value": 1.000239610671997,
+    "trainer": "scripts/train_lstm_only.py (standalone)"
   },
-  "training_date_utc": "2026-04-08T10:10:25.824748+00:00",
+  "training_date_utc": "2026-04-08T13:45:47.562306+00:00",
   "val_metrics": {
-    "test_failure_detection_rate": 0.9981780605862838,
-    "test_healthy_far": 0.9960919758231557,
-    "test_mean_error_failure": 0.19347278773784637,
-    "test_mean_error_healthy": 0.3441607654094696,
-    "test_separation_ratio": 0.5621581673622131
+    "best_val_loss": 0.36544129252433777,
+    "test_failure_detection_rate": 0.0019579050416054823,
+    "test_healthy_far": 0.03134904196010122,
+    "test_mean_error_failure": 0.18369373679161072,
+    "test_mean_error_healthy": 0.3376828134059906,
+    "test_separation_ratio": 0.5439831018447876
   }
 }
