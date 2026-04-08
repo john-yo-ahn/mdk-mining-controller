@@ -46,7 +46,7 @@ import pandas as pd
 
 from src.config import PROCESSED_DIR
 from src.pipeline.features import FEATURES_VERSION, split_temporal_tvt
-from src.models.lstm_autoencoder import AnomalyDetector
+from src.models.lstm_autoencoder import AnomalyDetector, filter_alive_rows
 
 
 @dataclass(frozen=True)
@@ -276,10 +276,26 @@ def run(cfg: ModeConfig) -> dict:
         test_df  = test_df[test_df["miner_id"].isin(kept_ids)].reset_index(drop=True)
         print(f"  Subsampled to {len(kept_ids)} miners: {sorted(kept_ids)}")
 
-    healthy_train = train_df[train_df["failure_type"] == "none"]
-    healthy_val   = val_df[val_df["failure_type"] == "none"]
-    healthy_test  = test_df[test_df["failure_type"] == "none"]
-    failure_test  = test_df[test_df["failure_type"] != "none"]
+    # Apply the offline-row filter to the healthy splits so the AE
+    # trains only on "actually healthy" telemetry. Failure sequences
+    # are NOT filtered here — the split into alive vs dead happens
+    # below and determines sep_alive vs sep_all.
+    healthy_train = filter_alive_rows(train_df[train_df["failure_type"] == "none"])
+    healthy_val   = filter_alive_rows(val_df[val_df["failure_type"] == "none"])
+    healthy_test  = filter_alive_rows(test_df[test_df["failure_type"] == "none"])
+    failure_test  = test_df[test_df["failure_type"] != "none"].reset_index(drop=True)
+
+    # Split failure_test into alive vs dead so the harness can report
+    # the honest separation metric (sep_alive) separately from the
+    # trivial metric (sep_all, which lumps shutdown sequences in).
+    fail_alive_mask = (failure_test["hashrate_th"] > 1.0) & (failure_test["voltage_v"] > 0.05)
+    failure_alive = failure_test[fail_alive_mask].reset_index(drop=True)
+    failure_dead  = failure_test[~fail_alive_mask].reset_index(drop=True)
+    print(
+        f"  failure_test: {len(failure_test):,} rows, "
+        f"{len(failure_alive):,} alive ({100*len(failure_alive)/max(len(failure_test),1):.1f}%), "
+        f"{len(failure_dead):,} dead (shutdown)"
+    )
 
     # Sample test set for faster inference during iteration.
     # Full mode leaves test_sample_frac=1.0 for canonical numbers.
@@ -291,16 +307,19 @@ def run(cfg: ModeConfig) -> dict:
             n = max(int(len(df) * cfg.test_sample_frac), 1)
             idx = rng.choice(len(df), size=n, replace=False)
             return df.iloc[np.sort(idx)].reset_index(drop=True)
-        healthy_test_eval = _sample(healthy_test)
-        failure_test_eval = _sample(failure_test)
+        healthy_test_eval  = _sample(healthy_test)
+        failure_alive_eval = _sample(failure_alive)
+        failure_dead_eval  = _sample(failure_dead)
     else:
-        healthy_test_eval = healthy_test
-        failure_test_eval = failure_test
+        healthy_test_eval  = healthy_test
+        failure_alive_eval = failure_alive
+        failure_dead_eval  = failure_dead
 
     print(
         f"  Healthy train: {len(healthy_train):,} | val: {len(healthy_val):,} | "
         f"test (eval): {len(healthy_test_eval):,}  |  "
-        f"Failure test (eval): {len(failure_test_eval):,}"
+        f"Failure alive (eval): {len(failure_alive_eval):,}  |  "
+        f"Failure dead (eval): {len(failure_dead_eval):,}"
     )
 
     lstm = AnomalyDetector(
@@ -317,10 +336,16 @@ def run(cfg: ModeConfig) -> dict:
     X_train = lstm.prepare_sequences(healthy_train, stride=cfg.stride)
     X_val = lstm.prepare_sequences(healthy_val, stride=cfg.stride)
     X_health_test = lstm.prepare_sequences(healthy_test_eval, stride=cfg.stride)
-    X_fail_test = lstm.prepare_sequences(failure_test_eval, stride=cfg.stride)
-    print(f"  Sequences built in {time.time()-t0:.1f}s: "
-          f"train={len(X_train):,} val={len(X_val):,} "
-          f"h_test={len(X_health_test):,} f_test={len(X_fail_test):,}")
+    X_fail_alive = lstm.prepare_sequences(failure_alive_eval, stride=cfg.stride) \
+        if len(failure_alive_eval) else np.empty((0, 60, 6), dtype=np.float32)
+    X_fail_dead = lstm.prepare_sequences(failure_dead_eval, stride=cfg.stride) \
+        if len(failure_dead_eval) else np.empty((0, 60, 6), dtype=np.float32)
+    print(
+        f"  Sequences built in {time.time()-t0:.1f}s: "
+        f"train={len(X_train):,} val={len(X_val):,} "
+        f"h_test={len(X_health_test):,} "
+        f"f_alive={len(X_fail_alive):,} f_dead={len(X_fail_dead):,}"
+    )
 
     if len(X_train) == 0 or len(X_val) == 0:
         raise SystemExit(
@@ -331,7 +356,8 @@ def run(cfg: ModeConfig) -> dict:
     # Free the upstream DataFrames before fit to keep RSS down in fast/full modes.
     del train_df, val_df, test_df
     del healthy_train, healthy_val, healthy_test, failure_test
-    del healthy_test_eval, failure_test_eval
+    del failure_alive, failure_dead
+    del healthy_test_eval, failure_alive_eval, failure_dead_eval
     gc.collect()
 
     print(f"  Training on {len(X_train):,} sequences...")
@@ -342,16 +368,11 @@ def run(cfg: ModeConfig) -> dict:
     val_errs = lstm.compute_reconstruction_error(X_val)
     lstm.set_threshold(val_errs, percentile=95.0)
 
-    # In phases 0 and A the "alive" filter doesn't exist yet, so treat the
-    # whole failure test set as "alive" and a zero-length "dead" set. The
-    # metric shape is stable across phases.
-    empty = np.zeros((0,) + X_fail_test.shape[1:], dtype=X_fail_test.dtype) \
-        if len(X_fail_test) else np.zeros((0, 60, 6), dtype=np.float32)
     metrics = compute_metrics(
         lstm,
         X_healthy_eval=X_health_test,
-        X_failure_alive=X_fail_test,
-        X_failure_dead=empty,
+        X_failure_alive=X_fail_alive,
+        X_failure_dead=X_fail_dead,
     )
 
     # Determinism spot-check: save to /tmp, reload, compare one metric.
@@ -362,13 +383,15 @@ def run(cfg: ModeConfig) -> dict:
         reload_metrics = compute_metrics(
             reloaded,
             X_healthy_eval=X_health_test,
-            X_failure_alive=X_fail_test,
-            X_failure_dead=empty,
+            X_failure_alive=X_fail_alive,
+            X_failure_dead=X_fail_dead,
         )
-        drift = abs(metrics["sep_alive"] - reload_metrics["sep_alive"])
-        metrics["reload_sep_drift"] = float(drift)
-        if drift > 1e-3:
-            print(f"  WARNING: reload drift {drift:.6e} — determinism broken")
+        # Compare sep_all because sep_alive can be NaN when there are
+        # no failing miners in the sample.
+        drift_a = abs(metrics["sep_all"] - reload_metrics["sep_all"])
+        metrics["reload_sep_drift"] = float(drift_a)
+        if drift_a > 1e-3:
+            print(f"  WARNING: reload drift {drift_a:.6e} — determinism broken")
 
     metrics["mode"] = cfg.name
     metrics["wall_clock_s"] = round(time.time() - total_start, 1)

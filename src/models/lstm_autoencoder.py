@@ -21,6 +21,48 @@ except ImportError:
     HAS_TORCH = False
 
 
+def filter_alive_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop telemetry rows where the miner is effectively offline.
+
+    A row counts as offline if ``hashrate_th < 1.0`` OR
+    ``voltage_v < 0.05``. Those rows are neither "healthy" nor
+    "failing" in the sense the autoencoder is supposed to learn —
+    they represent shutdown, idle, or post-failure states where
+    every telemetry channel has collapsed to near-zero.
+
+    We drop them from the healthy training set because they would
+    pull the global healthy distribution toward zero in every
+    feature (a fleet spending ~2% of its time in maintenance
+    shutdowns would teach the AE that "near-zero everywhere" is a
+    normal healthy pattern, which defeats the point). And on the
+    evaluation side, shutdown sequences in the *failure* test set
+    are trivially easy to reconstruct — a sequence of zeros feeds
+    back as near-zero reconstruction error — which is why the
+    original LSTM looked like it was inverted (failures
+    reconstructing better than healthy). The right metric
+    concerns only failure sequences where the miner is still
+    alive and is producing telemetry that a useful detector
+    should recognize as anomalous; those are what we call
+    "alive failures" downstream.
+
+    This helper is called on the healthy training / validation /
+    test splits before prepare_sequences. Failure sequences are
+    NOT filtered by this helper; callers that want alive-only
+    failure slices should apply the same mask explicitly so the
+    distinction is visible in code.
+    """
+    mask = (df["hashrate_th"] > 1.0) & (df["voltage_v"] > 0.05)
+    dropped = int((~mask).sum())
+    if dropped > 0:
+        pct = 100.0 * dropped / max(len(df), 1)
+        print(
+            f"  filter_alive_rows: dropped {dropped:,} offline rows "
+            f"({pct:.2f}%) from {len(df):,}"
+        )
+    return df[mask].reset_index(drop=True)
+
+
 if HAS_TORCH:
     class LSTMEncoder(nn.Module):
         def __init__(self, input_dim: int, hidden_dim: int = 64, latent_dim: int = 32,

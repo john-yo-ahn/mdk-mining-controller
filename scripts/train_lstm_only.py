@@ -23,7 +23,7 @@ import pandas as pd
 
 from src.config import PROCESSED_DIR, MODELS_DIR
 from src.pipeline.features import split_temporal_tvt, FEATURES_VERSION
-from src.models.lstm_autoencoder import AnomalyDetector
+from src.models.lstm_autoencoder import AnomalyDetector, filter_alive_rows
 from src.models.metadata import save_model_metadata
 
 
@@ -53,15 +53,33 @@ def main():
     del df
     gc.collect()
 
-    healthy_train = train_df[train_df["failure_type"] == "none"]
-    healthy_val = val_df[val_df["failure_type"] == "none"]
-    healthy_test = test_df[test_df["failure_type"] == "none"]
-    failure_test = test_df[test_df["failure_type"] != "none"]
+    # Filter offline rows (hashrate≈0 or voltage≈0) out of the healthy
+    # splits so the AE trains and evaluates on rows where the miner is
+    # actually running. Shutdown rows drifted into the "healthy" class
+    # in the old pipeline and pulled the healthy distribution toward
+    # zero in every feature; they also contaminated the test metric
+    # because a shutdown failure sequence reconstructs as ~0 error.
+    healthy_train = filter_alive_rows(train_df[train_df["failure_type"] == "none"])
+    healthy_val = filter_alive_rows(val_df[val_df["failure_type"] == "none"])
+    healthy_test = filter_alive_rows(test_df[test_df["failure_type"] == "none"])
+
+    # Failure rows are NOT filtered — we split them into alive/dead
+    # to report sep_alive (the honest metric the plan gates on) and
+    # sep_all (the contaminated metric kept for continuity with the
+    # pre-Phase-B sidecar).
+    failure_test = test_df[test_df["failure_type"] != "none"].reset_index(drop=True)
+    fail_alive_mask = (failure_test["hashrate_th"] > 1.0) & (failure_test["voltage_v"] > 0.05)
+    failure_test_alive = failure_test[fail_alive_mask].reset_index(drop=True)
+    failure_test_dead = failure_test[~fail_alive_mask].reset_index(drop=True)
     print(
-        f"Healthy rows - train: {len(healthy_train):,} "
+        f"Healthy rows (alive) - train: {len(healthy_train):,} "
         f"val: {len(healthy_val):,} test: {len(healthy_test):,}"
     )
-    print(f"Failure rows in test: {len(failure_test):,}")
+    print(
+        f"Failure rows in test: {len(failure_test):,} "
+        f"({len(failure_test_alive):,} alive, "
+        f"{len(failure_test_dead):,} dead/shutdown)"
+    )
 
     lstm_model = AnomalyDetector(
         input_dim=6, seq_len=60, hidden_dim=64, latent_dim=32,
@@ -81,18 +99,23 @@ def main():
     X_val_seq = lstm_model.prepare_sequences(healthy_val, stride=5)
     print(f"  {len(X_val_seq):,} val sequences in {time.time()-t0:.1f}s")
 
-    print("Building test sequences (failure + healthy held out)...")
+    print("Building test sequences (alive failures + dead failures + healthy held out)...")
     t0 = time.time()
-    X_fail_seq = lstm_model.prepare_sequences(failure_test, stride=5)
+    X_fail_alive_seq = lstm_model.prepare_sequences(failure_test_alive, stride=5) \
+        if len(failure_test_alive) else np.empty((0, 60, 6), dtype=np.float32)
+    X_fail_dead_seq = lstm_model.prepare_sequences(failure_test_dead, stride=5) \
+        if len(failure_test_dead) else np.empty((0, 60, 6), dtype=np.float32)
     X_health_test_seq = lstm_model.prepare_sequences(healthy_test, stride=5)
     print(
-        f"  {len(X_fail_seq):,} failure + {len(X_health_test_seq):,} healthy "
-        f"test sequences in {time.time()-t0:.1f}s"
+        f"  {len(X_fail_alive_seq):,} alive + {len(X_fail_dead_seq):,} dead failure "
+        f"+ {len(X_health_test_seq):,} healthy test sequences "
+        f"in {time.time()-t0:.1f}s"
     )
 
     # CRUCIAL: free pandas frames before LSTM fit to avoid OOM.
     del train_df, val_df, test_df
     del healthy_train, healthy_val, healthy_test, failure_test
+    del failure_test_alive, failure_test_dead
     gc.collect()
     print("Freed upstream pandas frames before LSTM fit.")
 
@@ -105,39 +128,100 @@ def main():
     val_errors = lstm_model.compute_reconstruction_error(X_val_seq)
     lstm_model.set_threshold(val_errors, percentile=95.0)
 
-    lstm_val_metrics = {"best_val_loss": float(min(lstm_model.val_losses_) if lstm_model.val_losses_ else 0.0)}
-    if len(X_fail_seq) > 0 and len(X_health_test_seq) > 0:
-        fail_errors = lstm_model.compute_reconstruction_error(X_fail_seq)
+    lstm_val_metrics = {
+        "best_val_loss": float(
+            min(lstm_model.val_losses_) if lstm_model.val_losses_ else 0.0
+        ),
+    }
+    if len(X_health_test_seq) > 0:
         health_errors = lstm_model.compute_reconstruction_error(X_health_test_seq)
-        fail_preds = (fail_errors > lstm_model.threshold_).astype(int)
         health_preds = (health_errors > lstm_model.threshold_).astype(int)
-        sep = float(fail_errors.mean() / max(health_errors.mean(), 1e-10))
+        h_mean = float(health_errors.mean())
+
+        if len(X_fail_alive_seq) > 0:
+            fa_errors = lstm_model.compute_reconstruction_error(X_fail_alive_seq)
+            fa_preds = (fa_errors > lstm_model.threshold_).astype(int)
+            fa_mean = float(fa_errors.mean())
+            sep_alive = fa_mean / max(h_mean, 1e-10)
+            det_alive = float(fa_preds.mean())
+        else:
+            fa_errors = np.array([])
+            fa_mean = 0.0
+            sep_alive = float("nan")
+            det_alive = float("nan")
+
+        if len(X_fail_dead_seq) > 0:
+            fd_errors = lstm_model.compute_reconstruction_error(X_fail_dead_seq)
+            fd_mean = float(fd_errors.mean())
+        else:
+            fd_errors = np.array([])
+            fd_mean = 0.0
+
+        # sep_all keeps the old contaminated definition for continuity
+        # with the pre-Phase-B sidecar — it concatenates alive and dead
+        # failure errors and divides by healthy.
+        if len(fa_errors) or len(fd_errors):
+            f_all = np.concatenate([a for a in (fa_errors, fd_errors) if len(a)])
+            f_all_mean = float(f_all.mean())
+            sep_all = f_all_mean / max(h_mean, 1e-10)
+            det_all = float(((f_all > lstm_model.threshold_).astype(int)).mean())
+        else:
+            f_all_mean = 0.0
+            sep_all = float("nan")
+            det_all = float("nan")
 
         print()
         print("LSTM-AE Test Results (val-calibrated threshold):")
-        print(f"  Healthy sequences flagged:  {health_preds.sum()}/{len(health_preds)} "
-              f"({health_preds.mean():.1%})")
-        print(f"  Failure sequences flagged:  {fail_preds.sum()}/{len(fail_preds)} "
-              f"({fail_preds.mean():.1%})")
-        print(f"  Mean error (healthy): {health_errors.mean():.6f}")
-        print(f"  Mean error (failure): {fail_errors.mean():.6f}")
-        print(f"  Separation ratio:     {sep:.2f}x")
+        print(
+            f"  Healthy sequences flagged:  {health_preds.sum()}/{len(health_preds)} "
+            f"({health_preds.mean():.1%})"
+        )
+        print(
+            f"  Mean error (healthy):       {h_mean:.6f}"
+        )
+        print(
+            f"  Mean error (failure alive): {fa_mean:.6f}  "
+            f"({len(fa_errors)} sequences)"
+        )
+        print(
+            f"  Mean error (failure dead):  {fd_mean:.6f}  "
+            f"({len(fd_errors)} sequences)"
+        )
+        print(f"  Separation ratio (alive):    {sep_alive:.3f}x  ← honest metric")
+        print(f"  Separation ratio (all):      {sep_all:.3f}x  (includes shutdowns)")
+        print(
+            f"  Detection rate (alive):      "
+            f"{det_alive if not np.isnan(det_alive) else 0:.1%}"
+        )
 
         lstm_val_metrics.update({
             "test_healthy_far": float(health_preds.mean()),
-            "test_failure_detection_rate": float(fail_preds.mean()),
-            "test_mean_error_healthy": float(health_errors.mean()),
-            "test_mean_error_failure": float(fail_errors.mean()),
-            "test_separation_ratio": sep,
+            "test_mean_error_healthy": h_mean,
+            "test_mean_error_failure_alive": fa_mean,
+            "test_mean_error_failure_dead": fd_mean,
+            "test_n_failure_alive": int(len(fa_errors)),
+            "test_n_failure_dead": int(len(fd_errors)),
+            "test_separation_ratio_alive": sep_alive,
+            "test_separation_ratio_all": sep_all,
+            "test_detection_rate_alive": det_alive,
+            "test_detection_rate_all": det_all,
+            # Legacy keys kept as aliases so the consistency check can
+            # still match the sidecar shape from commit 7a460ac.
+            "test_failure_detection_rate": det_all,
+            "test_mean_error_failure": f_all_mean,
+            "test_separation_ratio": sep_all,
         })
 
     lstm_model.save()
+    n_test_rows = (
+        len(X_fail_alive_seq) + len(X_fail_dead_seq) + len(X_health_test_seq)
+    )
     save_model_metadata(
         model_path=MODELS_DIR / "lstm_ae.pt",
         model_type="lstm_autoencoder",
         n_train_rows=len(X_train_seq),
         n_val_rows=len(X_val_seq),
-        n_test_rows=(len(X_fail_seq) + len(X_health_test_seq)) if len(X_fail_seq) > 0 else 0,
+        n_test_rows=n_test_rows,
         val_metrics=lstm_val_metrics,
         feature_names=lstm_model.feature_names_,
         training_config={
