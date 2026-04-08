@@ -16,7 +16,26 @@ anything below your time budget.
 These would be visible to anyone reading the code or running the
 dashboard. They are not merely cosmetic.
 
-### F1. CLI live inference is silently degraded
+### F1. CLI live inference is silently degraded — ✅ CLOSED (Apr 8, Phase B)
+
+**Status:** shipped in commit (see `git log --grep="live inference"`).
+Buffer size bumped 120 → 10080 (7 days); `compute_features` now
+delegates to `build_feature_matrix` for the full 152-feature vector;
+`export_lstm_sequence` uses `seq_len=60` and the persistent scaler
+propagated from the saved model at load time; silent try/except
+swallows replaced with once-per-session error logging. Verified via
+`scripts/test_live_feature_parity.py` at 88% feature match rate
+(remaining drift is legitimate warmup behavior on 7-day rolling
+features, not a bug).
+
+**Residual known issue:** per-tick cost is ~800ms per miner because
+each call runs the full batch feature builder on a single-miner
+DataFrame. For 30 miners at 1 tick/second this is slower than real
+time. Fix would be to collect all 30 miners into a single DataFrame
+and call `build_feature_matrix` once per tick — would bring amortized
+cost down ~5-10×. Tracked as new sub-item F1a below.
+
+### F1a. Bulk-miner live inference optimization
 
 **Files:** `src/cli/ai_bridge.py` (`MinerBuffer.compute_features`,
 `MinerBuffer.export_lstm_sequence`, `AIBridge.predict`)
@@ -252,7 +271,19 @@ for col in old_features.columns:
 
 ---
 
-### F8. FutureWarnings cleanup (groupby.apply, divide by zero)
+### F8. FutureWarnings cleanup — ✅ CLOSED (Apr 8, Phase A)
+
+`divide by zero` RuntimeWarning in `compute_variance_trend` silenced
+via `np.errstate`. Pandas `DataFrameGroupBy.apply` FutureWarning at
+the warmup-drop step replaced with a cumcount-based filter (no
+groupby-apply). The other groupby-apply site in
+`compute_cross_signal_correlations` now has a single-miner fast path
+that avoids the groupby entirely; the multi-miner path silences the
+specific FutureWarning locally via `warnings.catch_warnings`. Full
+pipeline runs now emit no FutureWarning or RuntimeWarning during
+feature engineering.
+
+### F8-original. (historical)
 
 **Files:** `src/pipeline/features.py` lines 220, 220, 220, 220, 465
 (groupby.apply); line 186 (divide by zero in 24h/7d ratio).
@@ -328,7 +359,18 @@ in step 8.
 
 ## P3 — Production-ish polish (likely out of scope for this assignment)
 
-### F11. Model versioning and metadata sidecar
+### F11. Model versioning and metadata sidecar — ✅ CLOSED (Apr 8, Phase A)
+
+Shipped in `src/models/metadata.py` and wired into `run_pipeline.py`
+step 7/8 and `scripts/train_lstm_only.py`. Every saved model now gets
+a `.metadata.json` sidecar recording `git_commit`, `git_dirty`,
+`training_date_utc`, `n_train_rows`, `n_val_rows`, `n_test_rows`,
+`val_metrics`, `feature_names_hash`, and `training_config`. Sidecars
+are committed to git (while the model binaries themselves remain
+gitignored) so reviewers can inspect training provenance without
+running anything.
+
+### F11-original. (historical)
 
 **Files:** `src/models/xgboost_classifier.py:save`, `lstm_autoencoder.py:save`
 
