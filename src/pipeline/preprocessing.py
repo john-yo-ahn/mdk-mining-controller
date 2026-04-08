@@ -88,17 +88,20 @@ def normalize_per_device(
     return df
 
 
-def preprocess_pipeline(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_pipeline(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     """Full preprocessing: missing values, plausibility, derived, normalize."""
-    print("Preprocessing pipeline:")
-    print(f"  Input: {len(df):,} rows")
+    if verbose:
+        print("Preprocessing pipeline:")
+        print(f"  Input: {len(df):,} rows")
 
     df = handle_missing_values(df)
-    print(f"  After missing value handling: {len(df):,} rows")
+    if verbose:
+        print(f"  After missing value handling: {len(df):,} rows")
 
     df = apply_plausibility_checks(df)
     df = add_derived_columns(df)
     df = normalize_per_device(df)
 
-    print(f"  Output: {len(df):,} rows, {len(df.columns)} columns")
+    if verbose:
+        print(f"  Output: {len(df):,} rows, {len(df.columns)} columns")
     return df

@@ -187,12 +187,16 @@ def compute_variance_trend(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame
             continue
         rolling_24h = df.groupby("miner_id")[col].rolling(1440, min_periods=60).std().reset_index(level=0, drop=True)
         rolling_7d = df.groupby("miner_id")[col].rolling(10080, min_periods=1440).std().reset_index(level=0, drop=True)
-        # Ratio: recent / long-term
-        ratio = np.where(
-            rolling_7d.values > 1e-6,
-            rolling_24h.values / rolling_7d.values,
-            1.0
-        )
+        # Ratio: recent / long-term. np.where evaluates both branches
+        # numerically so the division is computed even when the guard
+        # rejects it; wrap in errstate to silence the cosmetic
+        # RuntimeWarning from divide-by-zero inside the dead branch.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(
+                rolling_7d.values > 1e-6,
+                rolling_24h.values / rolling_7d.values,
+                1.0
+            )
         df[f"{col}_std_trend"] = ratio
 
     return df
@@ -211,6 +215,11 @@ def compute_cross_signal_correlations(
     """
     df = df.sort_values(["miner_id", "timestamp"]).reset_index(drop=True)
 
+    # Single-miner fast path: skip the groupby entirely. This matters
+    # for streaming live inference (one miner per call) where the
+    # groupby-apply return-shape edge case would otherwise blow up.
+    n_miners = df["miner_id"].nunique()
+
     for a, b in pairs:
         if a not in df.columns or b not in df.columns:
             continue
@@ -218,13 +227,32 @@ def compute_cross_signal_correlations(
         col_name = f"corr_{a}_{b}_6h"
         df[col_name] = 0.0
 
+        if n_miners == 1:
+            ga = df[a].astype(np.float64)
+            gb = df[b].astype(np.float64)
+            r = ga.rolling(window_minutes, min_periods=60).corr(gb)
+            df[col_name] = r.fillna(0).values
+            continue
+
         def _rolling_corr(group):
             ga = group[a].astype(np.float64)
             gb = group[b].astype(np.float64)
             r = ga.rolling(window_minutes, min_periods=60).corr(gb)
             return r
 
-        corrs = df.groupby("miner_id").apply(_rolling_corr).reset_index(level=0, drop=True)
+        # pandas 2.x deprecation warning about implicit group-column
+        # handling in apply(). The fix (include_groups=False or
+        # column subset) reshapes the returned Series unpredictably
+        # for this use case, so we silence the specific warning
+        # instead.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                message=".*DataFrameGroupBy.apply operated on the grouping columns.*",
+            )
+            corrs = df.groupby("miner_id").apply(_rolling_corr).reset_index(level=0, drop=True)
         df[col_name] = corrs.fillna(0).values
 
     return df
@@ -405,9 +433,21 @@ def build_feature_matrix(
     df: pd.DataFrame,
     config: FeatureConfig = FeatureConfig(),
     include_labels: bool = True,
+    drop_warmup: bool = True,
+    verbose: bool = True,
 ) -> pd.DataFrame:
-    """Full feature engineering pipeline."""
-    print("Building feature matrix...")
+    """
+    Full feature engineering pipeline.
+
+    drop_warmup: if True (default, batch behavior), drops the first
+        ~7 days per miner because the longest rolling windows can't
+        populate until then. Streaming callers pass False and handle
+        warmup by returning None while the buffer is short.
+    verbose: if True (default), prints per-stage column counts.
+        Streaming callers pass False to avoid log spam on every tick.
+    """
+    if verbose:
+        print("Building feature matrix...")
 
     sensor_cols = ["temperature_c", "hashrate_th", "power_w", "voltage_v"]
     trend_cols = ["temperature_c", "hashrate_th", "power_w", "jth", "voltage_v"]
@@ -415,27 +455,27 @@ def build_feature_matrix(
 
     # 1. Cross-signal ratios
     df = compute_cross_signal_ratios(df)
-    print(f"  After ratios:          {len(df.columns)} cols")
+    if verbose: print(f"  After ratios:          {len(df.columns)} cols")
 
     # 2. Rolling statistics (multi-timescale)
     df = compute_rolling_stats(df, sensor_cols + ["jth"], config.rolling_windows_minutes)
-    print(f"  After rolling stats:   {len(df.columns)} cols")
+    if verbose: print(f"  After rolling stats:   {len(df.columns)} cols")
 
     # 3. Rate of change
     df = compute_rate_of_change(df, config.rate_of_change_columns)
-    print(f"  After rate of change:  {len(df.columns)} cols")
+    if verbose: print(f"  After rate of change:  {len(df.columns)} cols")
 
     # 4. Short degradation slope (6h)
     df = compute_degradation_slope(df, config.degradation_slope_window_hours)
-    print(f"  After degr slope:      {len(df.columns)} cols")
+    if verbose: print(f"  After degr slope:      {len(df.columns)} cols")
 
     # 5. Long trend features (7d)
     df = compute_trend_features(df, trend_cols, config.trend_window_hours)
-    print(f"  After trend features:  {len(df.columns)} cols")
+    if verbose: print(f"  After trend features:  {len(df.columns)} cols")
 
     # 6. Variance trends
     df = compute_variance_trend(df, variance_cols)
-    print(f"  After variance trends: {len(df.columns)} cols")
+    if verbose: print(f"  After variance trends: {len(df.columns)} cols")
 
     # 7. Cross-signal correlations
     pairs = [
@@ -445,33 +485,35 @@ def build_feature_matrix(
         ("power_w", "clock_frequency_mhz"),
     ]
     df = compute_cross_signal_correlations(df, pairs, config.correlation_window_minutes)
-    print(f"  After correlations:    {len(df.columns)} cols")
+    if verbose: print(f"  After correlations:    {len(df.columns)} cols")
 
     # 8. Autocorrelation lag-1
     df = compute_autocorrelation_lag1(df, ["hashrate_th", "temperature_c", "power_w"], config.autocorr_window_minutes)
-    print(f"  After autocorr:        {len(df.columns)} cols")
+    if verbose: print(f"  After autocorr:        {len(df.columns)} cols")
 
     # 9. Peak counts (intermittent faults)
     df = compute_peak_count(df, "power_w", config.peak_window_minutes, config.peak_sigma_threshold)
     df = compute_peak_count(df, "voltage_v", config.peak_window_minutes, config.peak_sigma_threshold)
-    print(f"  After peak counts:     {len(df.columns)} cols")
+    if verbose: print(f"  After peak counts:     {len(df.columns)} cols")
 
     # 10. Diurnal amplitude
     df = compute_diurnal_amplitude(df, "jth", config.diurnal_amplitude_window_hours)
     df = compute_diurnal_amplitude(df, "temperature_c", config.diurnal_amplitude_window_hours)
-    print(f"  After diurnal:         {len(df.columns)} cols")
+    if verbose: print(f"  After diurnal:         {len(df.columns)} cols")
 
     # 11. Cross-miner features
     if config.cross_miner_features_enabled:
         df = compute_cross_miner_features(df)
-        print(f"  After cross-miner:     {len(df.columns)} cols")
+        if verbose: print(f"  After cross-miner:     {len(df.columns)} cols")
 
-    # Drop warm-up rows (longest window needs data to fill)
-    # Keep rows after day 7 so the 7-day rolling windows have data
+    # Drop warm-up rows (longest window needs data to fill).
+    # Keep rows after day 7 so the 7-day rolling windows have data.
+    # Uses cumcount() instead of groupby-apply to avoid the pandas
+    # FutureWarning about implicit group-column handling.
     warmup_steps = min(10080, config.rolling_windows_minutes[-1])  # 7 days
-    df = df.groupby("miner_id", group_keys=False).apply(
-        lambda g: g.iloc[warmup_steps:]
-    ).reset_index(drop=True)
+    if drop_warmup:
+        row_num = df.groupby("miner_id").cumcount()
+        df = df[row_num >= warmup_steps].reset_index(drop=True)
 
     # Fill remaining NaN with 0
     numeric_cols = df.select_dtypes(include=[np.number]).columns
@@ -479,7 +521,7 @@ def build_feature_matrix(
     df = df.replace([np.inf, -np.inf], 0)
 
     feature_cols = [c for c in df.columns if c not in FEATURE_EXCLUDE_COLUMNS]
-    print(f"  FINAL: {len(df):,} rows, {len(feature_cols)} features")
+    if verbose: print(f"  FINAL: {len(df):,} rows, {len(feature_cols)} features")
     return df
 
 
