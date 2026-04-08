@@ -319,6 +319,15 @@ class AnomalyDetector:
         if not HAS_TORCH:
             return np.zeros(len(X))
 
+        # Saturate the CPU for the forward pass. torch's default is often
+        # 1 thread when launched under certain launchers (uv in particular
+        # has been observed to ship an OMP_NUM_THREADS=1 env to subprocs),
+        # which leaves ~80% of the cores idle on this box. Pinning to the
+        # physical core count roughly halves the wall-clock of the bigger
+        # compute calls used by the experiment harness.
+        import os
+        torch.set_num_threads(max(1, os.cpu_count() or 1))
+
         self.model_.eval()
         # Snapshot then move to CPU for inference; restore after.
         was_on = next(self.model_.parameters()).device
