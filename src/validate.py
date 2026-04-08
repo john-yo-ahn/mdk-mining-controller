@@ -53,7 +53,9 @@ def test_holdout(verbose: bool = True) -> Dict:
     print(f"  Test on:    {', '.join(holdout_types)} (NEVER SEEN)")
 
     # Generate training data with only train_types
-    config = SimulationConfig(n_miners=20, n_days=5, random_seed=100)
+    # n_days must exceed the feature warmup window (7 days) with enough
+    # margin for the train/val split to have signal. See FeatureConfig.
+    config = SimulationConfig(n_miners=20, n_days=14, random_seed=100)
     gen = MiningDataGenerator(config)
     df_all = gen.generate()
 
@@ -90,7 +92,7 @@ def test_holdout(verbose: bool = True) -> Dict:
 
     # Now test on hold-out types using a SEPARATE dataset
     subheader("Hold-out evaluation")
-    config2 = SimulationConfig(n_miners=15, n_days=5, random_seed=200)
+    config2 = SimulationConfig(n_miners=15, n_days=14, random_seed=200)
     gen2 = MiningDataGenerator(config2)
     df_test_all = gen2.generate()
 
@@ -170,7 +172,7 @@ def test_race(verbose: bool = True) -> Dict:
         print("  No trained model found. Run 'uv run mdk train' first.")
         return {}
 
-    config = SimulationConfig(n_miners=20, n_days=7, random_seed=300)
+    config = SimulationConfig(n_miners=20, n_days=14, random_seed=300)
     gen = MiningDataGenerator(config)
     df = gen.generate()
 
@@ -265,7 +267,7 @@ def test_blind(verbose: bool = True) -> Dict:
         return {}
 
     # Generate healthy-only data
-    config = SimulationConfig(n_miners=12, n_days=5, random_seed=400)
+    config = SimulationConfig(n_miners=12, n_days=14, random_seed=400)
     config.failure_fraction = 0.0  # NO failures
     gen = MiningDataGenerator(config)
     df_healthy = gen.generate()
@@ -375,7 +377,7 @@ def test_noise(verbose: bool = True) -> Dict:
         return {}
 
     # Generate base data with known failures
-    config = SimulationConfig(n_miners=10, n_days=5, random_seed=500)
+    config = SimulationConfig(n_miners=10, n_days=14, random_seed=500)
     gen = MiningDataGenerator(config)
     df_base = gen.generate()
 
