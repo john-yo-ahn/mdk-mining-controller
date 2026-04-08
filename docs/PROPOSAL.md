@@ -1,0 +1,182 @@
+# Technical Proposal: AI-Driven Mining Optimization & Predictive Maintenance
+
+## Project: MDK AI Controller
+**Author**: John Ahn
+**Platform**: Tether Mining Development Kit (MDK) / Mining OS (MOS)
+**Duration**: 3 Weeks
+**Date**: April 2026
+
+---
+
+## 1. Problem Statement
+
+Bitcoin mining profitability depends on two controllable variables: **hardware efficiency (J/TH)** and **energy cost**. In current operations, site operators manually adjust chip frequencies, voltages, and cooling parameters based on experience — a process that doesn't scale across thousands of ASICs and can't react fast enough to changing conditions.
+
+Two critical problems demand AI-driven solutions:
+
+1. **Hardware failures cause costly downtime**: Chip and machine breakdowns lead to expensive repairs and lost hashing revenue. Operators lack early warning systems that can flag degrading machines before critical failure.
+
+2. **Suboptimal efficiency at scale**: Tuning chip frequency and power is done arbitrarily. Each ASIC has a unique optimal operating point that shifts with ambient temperature, coolant conditions, and chip age — finding and maintaining this point for every chip in a fleet is beyond human capacity.
+
+Since mining revenue is continuous (pool mining pays per hash), every percentage point of efficiency improvement or hour of prevented downtime directly translates to revenue.
+
+---
+
+## 2. Proposed Approach: Dual-Track AI Controller
+
+We propose a **combined approach** tackling both problems with a unified data pipeline and two complementary AI modules:
+
+### Track A: Predictive Maintenance (Primary Focus)
+An **XGBoost-based classifier** trained on synthetic telemetry to detect pre-failure patterns, supplemented by an **LSTM-Autoencoder** for unsupervised anomaly detection.
+
+**Why this combination:**
+- XGBoost achieves ~98% accuracy on tabular sensor data and provides interpretable feature importance (operators can understand WHY a machine is flagged)
+- LSTM-Autoencoder captures temporal degradation patterns without requiring labeled failure data — critical since real failure datasets are unavailable
+- Together they cover both known failure modes (supervised) and novel anomalies (unsupervised)
+
+**Signals monitored:**
+- Chip temperature trends and gradients
+- J/TH degradation over time (efficiency slope)
+- Hashrate deviation from nominal (>10% drop = flag)
+- Power consumption instability (voltage ripple)
+- Cross-signal ratios (temperature-per-watt anomalies)
+
+### Track B: Dynamic Efficiency Optimization (Stretch Goal)
+A **rule-based optimizer** (upgradeable to RL) that adjusts operating parameters based on real-time conditions:
+
+- When ambient temperature rises → reduce chip frequency to maintain thermal headroom
+- When energy price drops → increase frequency to maximize hashrate during cheap energy windows
+- When efficiency degrades beyond threshold → flag for maintenance and reduce to safe operating point
+
+**Why rule-based first:**
+- The meeting emphasized that the project is in design-thinking mode, not production deployment
+- Rule-based controllers are transparent, auditable, and safe — critical for hardware control
+- The rule set can be formalized as a SAC/PPO reward function for future RL migration
+
+---
+
+## 3. Data Pipeline Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TELEMETRY SOURCES                            │
+│  ASIC Miners (via MDK Workers)  │  Containers  │  Power Meters     │
+└──────────────────┬──────────────┴──────┬───────┴────────┬──────────┘
+                   │                     │                │
+                   ▼                     ▼                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    INGESTION & PREPROCESSING                        │
+│  • Parse synthetic CSV/JSON telemetry                               │
+│  • Align timestamps across device types                             │
+│  • Handle missing values (forward-fill for sensors)                 │
+│  • Normalize per-device (Z-score within device history)             │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FEATURE ENGINEERING                               │
+│  • Rolling statistics (mean, std, min, max) at 2min/15min/1hr      │
+│  • Rate of change (dT/dt, dHashrate/dt, dPower/dt)                 │
+│  • Cross-signal ratios (J/TH, temp-per-watt)                       │
+│  • True Efficiency KPI computation                                  │
+│  • Degradation slope (linear regression on rolling J/TH window)    │
+└──────────┬──────────────────────────────────┬──────────────────────┘
+           │                                  │
+           ▼                                  ▼
+┌────────────────────────┐     ┌──────────────────────────────────┐
+│  PREDICTIVE MAINTENANCE│     │  EFFICIENCY OPTIMIZER             │
+│  • XGBoost classifier  │     │  • Rule-based controller          │
+│  • LSTM-Autoencoder    │     │  • Condition-action policies      │
+│  • Anomaly scoring     │     │  • Energy-price-aware scheduling  │
+└──────────┬─────────────┘     └──────────────┬───────────────────┘
+           │                                  │
+           ▼                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DECISION & OUTPUT LAYER                           │
+│  • Maintenance alerts (Critical/High/Medium severity)               │
+│  • Recommended frequency/voltage adjustments                        │
+│  • Fleet health dashboard and KPI reporting                         │
+│  • Safety constraints enforcement (thermal limits, max power)       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. True Efficiency (TE) KPI Design
+
+Standard J/TH only captures chip-level energy-to-hashrate conversion. We propose a **True Efficiency** metric that incorporates the full operational context:
+
+```
+TE = Hashrate_actual / (P_chip + P_cooling * α + P_infrastructure * β)
+```
+
+Where:
+- `P_chip` = Direct ASIC power consumption (W)
+- `P_cooling` = Cooling system power (fans, pumps, chillers) allocated per device
+- `α` = Cooling overhead factor (proportion attributable to this device)
+- `P_infrastructure` = Network, control, lighting overhead allocated per device
+- `β` = Infrastructure allocation factor
+
+**Environmental adjustment:**
+```
+TE_adjusted = TE * (1 - δ_temp * max(0, T_ambient - T_baseline))
+```
+Where `δ_temp` captures the efficiency loss per degree above baseline (empirically ~0.5-1% per C above 25C for air-cooled systems).
+
+**Degradation-aware variant:**
+```
+TE_health = TE_adjusted * (Hashrate_actual / Hashrate_nameplate)
+```
+This captures both environmental conditions and machine aging in a single number.
+
+---
+
+## 5. Expected Operational Benefits
+
+| Benefit | Mechanism | Estimated Impact |
+|---|---|---|
+| Reduced unplanned downtime | Early failure detection (24-72hr warning) | 10-20% reduction in repair costs |
+| Improved fleet efficiency | Dynamic tuning per ambient conditions | 3-8% J/TH improvement |
+| Extended hardware lifespan | Avoid thermal cycling stress | 10-15% longer economic life |
+| Lower energy costs | Energy-price-aware scheduling | 5-10% energy cost reduction |
+| Faster fault diagnosis | Automated root cause via feature importance | Reduce mean-time-to-repair |
+
+---
+
+## 6. Security & Safety Considerations
+
+### Safety Constraints (Non-Negotiable)
+- **Thermal hard limit**: Never allow chip temperature to exceed manufacturer-rated max (typically 95C). Controller must have a hardware-independent thermal cutoff.
+- **Rate limiting**: Frequency/voltage changes must be rate-limited (max 1 change per 5 minutes) to prevent thermal cycling damage.
+- **Fallback mode**: If AI controller fails or produces anomalous output, system defaults to conservative operating point (Normal mode, rated frequency).
+- **Human override**: All automated decisions must be overridable by operators. AI recommends, humans confirm for critical actions.
+
+### Security Risks
+- **Adversarial sensor data**: Corrupted telemetry could cause the controller to make damaging decisions. Implement sensor plausibility checks (physical bounds validation).
+- **Command injection**: The AI controller interfaces with hardware control APIs. All command outputs must be validated against allowed ranges before execution.
+- **Model poisoning**: If the model is retrained on operational data, an attacker who compromises sensor data could poison the model. Use data integrity verification.
+- **Network isolation**: The AI controller should run on an isolated network segment, not exposed to the internet.
+
+---
+
+## 7. Technology Stack
+
+| Component | Technology | Justification |
+|---|---|---|
+| Data processing | Python + Pandas/Polars | Standard for data engineering, fast tabular ops |
+| Feature engineering | NumPy, SciPy | Rolling statistics, signal processing |
+| Predictive model | XGBoost, scikit-learn | Best accuracy on tabular data, interpretable |
+| Anomaly detection | PyTorch (LSTM-Autoencoder) | Temporal pattern capture, unsupervised |
+| Visualization | Matplotlib, Plotly | Interactive dashboards, time-series plots |
+| Synthetic data | NumPy + physics models | Thermodynamically plausible data generation |
+| Notebooks | Jupyter | Exploratory analysis, presentation |
+
+---
+
+## 8. Timeline
+
+| Week | Focus | Deliverable |
+|---|---|---|
+| **Week 1** | Data pipeline + EDA + KPI design | Working ingestion pipeline, TE KPI formula, correlation analysis |
+| **Week 2** | Predictive maintenance model | XGBoost classifier, LSTM-Autoencoder, anomaly scoring |
+| **Week 3** | Optimizer + report + polish | Rule-based optimizer, technical report, architecture diagram |

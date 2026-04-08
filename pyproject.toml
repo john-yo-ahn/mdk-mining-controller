@@ -1,0 +1,33 @@
+[project]
+name = "mdk-project"
+version = "0.1.0"
+description = "AI-Driven Mining Optimization & Predictive Maintenance for Tether MDK"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy<2",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
+    "xgboost<2.0",
+    "matplotlib>=3.7",
+    "plotly>=5.18",
+    "seaborn>=0.13",
+    "tqdm>=4.65",
+    "joblib>=1.3",
+    "pyarrow>=14.0",
+    "textual>=0.85",
+    "rich>=13.0",
+    "duckdb>=1.5.1",
+    "torch>=2.0,<2.3",
+]
+
+[project.optional-dependencies]
+ml = ["torch>=2.1"]
+notebooks = ["jupyter>=1.0", "ipykernel>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.scripts]
+mdk = "src.cli.__main__:main"
+

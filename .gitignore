@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Data artifacts — all regenerable from src/
+# Raw synthetic telemetry + DuckDB files
+data/raw/*.parquet
+data/raw/*.duckdb
+data/raw/*.duckdb.wal
+
+# Engineered feature matrix (multi-GB) and trained models.
+# We exclude contents but leave the directories themselves tracked
+# via .gitkeep files (see the negation rules below).
+data/processed/*
+data/models/*
+
+# Keep the directory skeleton discoverable in git so a fresh clone
+# has the expected layout.
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/models/.gitkeep
+
+# Claude Code local state
+.claude/settings.local.json

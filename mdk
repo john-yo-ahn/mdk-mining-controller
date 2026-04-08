@@ -1,0 +1,4 @@
+#!/bin/bash
+# MDK Mining Dashboard — simple launcher
+cd "$(dirname "$0")"
+python3 -m src.cli "$@"
