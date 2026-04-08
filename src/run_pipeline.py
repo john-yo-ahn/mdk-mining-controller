@@ -36,8 +36,11 @@ def main():
     print("STEP 1: Generating synthetic mining telemetry")
     print("=" * 70)
 
-    # Full-scale: 20 miners × 90 days for long-timescale degradation patterns
-    config = SimulationConfig(n_miners=20, n_days=90, container_size=10)
+    # Use config.py defaults (30 miners × 120 days). The override that
+    # used to live here (n_miners=20, n_days=90) was left over from
+    # early development when we wanted fast iteration; it's now the
+    # job of config.py to hold the canonical scale.
+    config = SimulationConfig()
     generator = MiningDataGenerator(config)
 
     # Load from cache if parquet exists and matches expected size
@@ -192,8 +195,12 @@ def main():
     print(f"  Training time: {time.time()-t0:.1f}s")
 
     # Threshold tuning uses VALIDATION scores, not test. This is the key
-    # correctness fix for the Apr 8 data-leakage issue.
-    xgb_model.optimize_threshold(X_val, y_val, strategy="f1_max")
+    # correctness fix for the Apr 8 data-leakage issue. The f1_with_floor
+    # strategy falls back to precision >= 0.05 if F1-max would collapse
+    # to a threshold that flags everything under extreme class imbalance.
+    xgb_model.optimize_threshold(
+        X_val, y_val, strategy="f1_with_floor", min_precision=0.05,
+    )
 
     # Final metrics: test set, untouched until this moment.
     print("\n  Final test-set metrics (model + threshold never saw this data):")

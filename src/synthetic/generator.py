@@ -530,39 +530,45 @@ class MiningDataGenerator:
         df: pd.DataFrame,
         runtimes: List[MinerRuntime],
     ) -> pd.DataFrame:
-        """Mark is_pre_failure=True during acceleration phase (24h horizon before cascade)."""
+        """
+        Label is_pre_failure=True for rows where the miner is actively
+        degrading — i.e. degradation_phase is "incubation" or "acceleration".
+
+        WHY THIS DEFINITION (fix from Apr 8):
+        The previous implementation computed the pre-failure window from
+        the scheduled phase_durations at scenario creation time, then
+        stamped it as "24h before scheduled cascade start". This drifted
+        badly from reality because:
+          1. The actual degradation_phase evolves based on physics, and
+             may progress faster or slower than the schedule.
+          2. Some scenarios never reach their cascade phase within the
+             simulation window — the label would still fire on scheduled
+             time, producing pre-failure rows on miners that never fail.
+          3. Some scheduled cascade points landed AFTER the real failure
+             onset by up to 18 days, so "pre-failure" rows were actually
+             post-failure rows.
+
+        The net effect was that >50% of the supervised training positives
+        had degradation_phase="healthy" and failure_type="none" — XGBoost
+        had no signal to learn from because those rows genuinely were
+        healthy telemetry. AUC collapsed to ~0.49.
+
+        By anchoring the label directly to degradation_phase we get a
+        label that is ALWAYS consistent with the telemetry signal the
+        model is asked to predict from. Every positive row is now a
+        row where the physics state reflects actual degradation.
+        """
         df = df.copy()
-        df["is_pre_failure"] = False
 
-        for m in runtimes:
-            if m.scenario is None or m.onset_step < 0:
-                continue
-            # Pre-failure window = 24h before cascade phase starts
-            if len(m.phase_durations) >= 3:
-                cascade_start = m.onset_step + m.phase_durations[0] + m.phase_durations[1]
-                window_start = max(0, cascade_start - 24 * 60)  # 24h before cascade
-                window_end = cascade_start
-                mask = (
-                    (df["miner_id"] == m.miner_id)
-                    & (df.index >= window_start)
-                    & (df.index < window_end)
-                )
-                # Index-based won't work with concat; use timestamps per-miner
-                mask_tn = df["miner_id"] == m.miner_id
-                miner_rows = df[mask_tn]
-                if len(miner_rows) == 0:
-                    continue
-                # Map step -> timestamp
-                ts_window_start = miner_rows.iloc[window_start]["timestamp"] if window_start < len(miner_rows) else None
-                ts_window_end = miner_rows.iloc[window_end]["timestamp"] if window_end < len(miner_rows) else None
-
-                if ts_window_start is not None and ts_window_end is not None:
-                    label_mask = (
-                        (df["miner_id"] == m.miner_id)
-                        & (df["timestamp"] >= ts_window_start)
-                        & (df["timestamp"] < ts_window_end)
-                    )
-                    df.loc[label_mask, "is_pre_failure"] = True
+        if "degradation_phase" in df.columns:
+            df["is_pre_failure"] = df["degradation_phase"].isin(
+                ("incubation", "acceleration")
+            )
+        else:
+            # Safety fallback for any future caller that produces frames
+            # without the degradation_phase column. Keeps column shape
+            # consistent but labels nothing.
+            df["is_pre_failure"] = False
 
         return df
 

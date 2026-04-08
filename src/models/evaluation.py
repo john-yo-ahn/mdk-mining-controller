@@ -69,7 +69,8 @@ def select_threshold_f1_max(
     # and N for thresholds. Drop the final (precision=1, recall=0) sentinel.
     p, r = precision[:-1], recall[:-1]
     denom = p + r
-    f1 = np.where(denom > 0, 2 * p * r / denom, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f1 = np.where(denom > 0, 2 * p * r / denom, 0.0)
     if len(f1) == 0 or not np.isfinite(f1).any():
         return 0.5
     best_idx = int(np.nanargmax(f1))
@@ -96,6 +97,41 @@ def select_threshold_precision_floor(
     # thresholds is ascending → first valid = lowest threshold meeting floor
     first_idx = int(np.argmax(valid))
     return float(thresholds[first_idx])
+
+
+def select_threshold_f1_with_floor(
+    y_true: np.ndarray,
+    y_scores: np.ndarray,
+    min_precision: float = 0.05,
+) -> float:
+    """
+    F1-max with a precision-floor safety net.
+
+    Try F1-max first. If the resulting precision on y_true/y_scores falls
+    below min_precision, fall back to precision-floor selection instead.
+
+    This exists because F1-max can mathematically "collapse" to a very
+    low threshold under severe class imbalance. The collapse isn't a
+    bug — when the positive-class probability distribution is compressed
+    toward zero, "flag everything" really does maximize F1 on paper —
+    but it produces an alert rule that cries wolf on every row and is
+    useless operationally. The precision floor gives the operator a
+    principled fallback they can reason about: "never below this
+    false-alarm rate".
+
+    Default min_precision=0.05 translates to "no more than 19 false
+    alarms per correct detection". Reasonable for predictive
+    maintenance where an operator will triage the flagged window, not
+    auto-shutdown the miner.
+    """
+    f1_thresh = select_threshold_f1_max(y_true, y_scores)
+    y_pred = (y_scores >= f1_thresh).astype(int)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    precision_at_f1 = tp / max(tp + fp, 1)
+    if precision_at_f1 >= min_precision:
+        return f1_thresh
+    return select_threshold_precision_floor(y_true, y_scores, min_precision)
 
 
 def select_anomaly_threshold(

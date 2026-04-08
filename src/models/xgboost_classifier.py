@@ -17,6 +17,7 @@ from .evaluation import (
     compute_classification_metrics,
     select_threshold_by_recall,
     select_threshold_f1_max,
+    select_threshold_f1_with_floor,
     select_threshold_precision_floor,
 )
 
@@ -143,27 +144,41 @@ class MinerFailureClassifier:
         self,
         X_val: pd.DataFrame,
         y_val: np.ndarray,
-        strategy: str = "f1_max",
+        strategy: str = "f1_with_floor",
         target_recall: float = 0.85,
-        min_precision: float = 0.10,
+        min_precision: float = 0.05,
     ) -> float:
         """
         Pick a decision threshold from validation scores.
 
-        strategy="f1_max" (default, recommended): maximize F1. Balances
-            precision and recall. Won't collapse to 0 under extreme imbalance.
+        strategy="f1_with_floor" (default, recommended): maximize F1, but
+            fall back to precision_floor selection if F1-max collapses to
+            a threshold where precision is below min_precision. This is
+            the correct default for imbalanced predictive-maintenance
+            workloads: it behaves like F1-max when the positive class is
+            learnable, and like precision-floor when F1-max would
+            degenerate into "flag everything".
 
-        strategy="precision_floor": pick the lowest threshold that still
-            achieves min_precision, maximizing recall subject to that floor.
-            Use when you have a hard false-alarm budget.
+        strategy="f1_max": pure F1-max, no safety net. Can collapse to 0
+            under extreme imbalance.
 
-        strategy="recall_target": legacy behavior — highest threshold still
-            achieving target_recall. Use only when false negatives are far
-            more expensive than false positives AND the model is well-
-            calibrated; otherwise it degenerates under class imbalance.
+        strategy="precision_floor": pick the lowest threshold that
+            achieves min_precision, maximizing recall subject to that
+            floor. Use when you have a hard false-alarm budget.
+
+        strategy="recall_target": legacy behavior — highest threshold
+            still achieving target_recall. Use only when false negatives
+            are far more expensive than false positives AND the model is
+            well-calibrated; otherwise it degenerates under class
+            imbalance.
         """
         y_prob = self.predict_proba(X_val)[:, 1]
-        if strategy == "f1_max":
+        if strategy == "f1_with_floor":
+            self.threshold_ = select_threshold_f1_with_floor(
+                y_val, y_prob, min_precision=min_precision,
+            )
+            detail = f"F1-max or precision >= {min_precision}"
+        elif strategy == "f1_max":
             self.threshold_ = select_threshold_f1_max(y_val, y_prob)
             detail = "maximize F1"
         elif strategy == "precision_floor":
@@ -178,7 +193,8 @@ class MinerFailureClassifier:
             detail = f"recall >= {target_recall}"
         else:
             raise ValueError(
-                f"Unknown strategy {strategy!r}; use f1_max, precision_floor, or recall_target"
+                f"Unknown strategy {strategy!r}; use f1_with_floor, "
+                f"f1_max, precision_floor, or recall_target"
             )
         print(
             f"  Threshold ({strategy}, {detail}): {self.threshold_:.4f} "

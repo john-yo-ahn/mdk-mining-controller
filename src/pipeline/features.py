@@ -32,7 +32,14 @@ from ..config import FeatureConfig, DEFAULT_MINER_SPECS, FEATURE_EXCLUDE_COLUMNS
 # so a version bump guarantees a fresh rebuild even when the raw parquet
 # is unchanged. Without this, stale caches cause silent train/inference
 # drift that is extremely hard to debug.
-FEATURES_VERSION = 1
+#
+# Version history:
+#   v1 — initial feature set, 152 columns
+#   v2 — Apr 8: label fix in synthetic generator (is_pre_failure now
+#        derived from degradation_phase instead of scheduled phase
+#        durations). Same feature columns, but labels differ, so cached
+#        features from v1 will train a different model.
+FEATURES_VERSION = 2
 
 
 # ─── Cross-signal ratios ─────────────────────────────────────────────

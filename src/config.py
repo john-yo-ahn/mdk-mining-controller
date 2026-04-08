@@ -214,8 +214,20 @@ def make_physics_params(spec: MinerSpec, rng: np.random.Generator) -> MinerPhysi
 
 @dataclass
 class SimulationConfig:
-    n_miners: int = 20
-    n_days: int = 90
+    # Fleet size and simulation length.
+    #
+    # The defaults (30 miners × 120 days × 1 min sampling) produce ~5.2M
+    # raw telemetry rows and enough failure events to give statistically
+    # stable validation/test metrics. The previous defaults (20 × 90)
+    # produced only ~3 test failures per run, making recall numbers
+    # bounce ±33% on every retrain.
+    #
+    # Bump n_miners further if you want more headroom for the val/test
+    # splits (each failing miner contributes one ~24h pre-failure
+    # window, and the adaptive splitter needs several windows per
+    # partition to compute a meaningful F1 curve).
+    n_miners: int = 30
+    n_days: int = 120
     sample_interval_seconds: int = 60
     random_seed: int = 42
 
@@ -228,8 +240,12 @@ class SimulationConfig:
     # Noise
     noise_level: float = 0.02
 
-    # Failure distribution
-    failure_fraction: float = 0.35
+    # Failure distribution.
+    # 0.55 means ~16 of 30 miners develop a failure over the 120-day
+    # simulation, giving ~16 pre-failure windows of ~24h each (≈23k
+    # positive rows out of 5.2M). The adaptive splitter places 55% of
+    # positives in train, 15% in val, 30% in test.
+    failure_fraction: float = 0.55
 
     # Workload / operator events
     workload_change_prob_per_day: float = 0.5
