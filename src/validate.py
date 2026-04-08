@@ -79,10 +79,14 @@ def test_holdout(verbose: bool = True) -> Dict:
     X_val = val_split[feature_cols].fillna(0)
     y_val = val_split["is_pre_failure"].astype(int).values
 
-    # Train model
+    # Train model.
+    # Use the legacy recall-target strategy here on purpose: the hold-out
+    # test below wants the model to FLAG as much as possible so we can
+    # observe whether unseen failure types are caught at all. The
+    # precision penalty is acceptable in a generalization probe.
     model = MinerFailureClassifier(n_estimators=150, max_depth=5)
     model.fit(X_train, y_train, X_val, y_val)
-    model.optimize_threshold(X_val, y_val, target_recall=0.85)
+    model.optimize_threshold(X_val, y_val, strategy="recall_target", target_recall=0.85)
 
     # Now test on hold-out types using a SEPARATE dataset
     subheader("Hold-out evaluation")

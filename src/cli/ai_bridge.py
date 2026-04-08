@@ -223,7 +223,30 @@ class AIBridge:
         self._clear_minutes = 15        # below floor for 15 min = reset to LOW
 
     def load_models(self) -> bool:
-        """Load trained models from disk. Returns True if at least XGBoost loaded."""
+        """Load trained models from disk. Returns True if at least XGBoost loaded.
+
+        KNOWN LIMITATIONS of the live inference path (documented Apr 8):
+          1. MinerBuffer.compute_features() computes ~80 features but the
+             XGBoost model was trained on 152. Missing features are
+             silently filled with 0.0 via dict.get() in predict(), so
+             live predictions see a different distribution than training.
+          2. MinerBuffer.export_lstm_sequence() does its own per-miner
+             rolling normalization using the 30-row buffer. It ignores
+             the persistent scaler (feature_mean_/feature_std_) that was
+             fitted on training data and saved with the model.
+          3. The LSTM model was trained with seq_len=60, but the live
+             path calls export_lstm_sequence(seq_len=30). The resulting
+             shape mismatch silently fails inside a try/except in
+             predict(), so LSTM contribution to the combined score is
+             effectively always zero.
+          4. The risk-level escalation uses a hardcoded 0.25 threshold
+             (_score_floor), not the model's trained threshold.
+
+        Net effect: the live dashboard produces PLAUSIBLE but NOT
+        PRODUCTION-ACCURATE predictions. Use the batch pipeline metrics
+        (from `uv run python -m src.run_pipeline`) as the authoritative
+        model quality numbers, not the dashboard alerts.
+        """
         xgb_path = MODELS_DIR / "xgboost_failure.joblib"
         lstm_path = MODELS_DIR / "lstm_ae.pt"
 
@@ -249,6 +272,13 @@ class AIBridge:
                 print(f"  Failed to load LSTM-AE: {e}")
 
         self._models_loaded = self.xgb_model is not None
+        if self._models_loaded:
+            # One-line user-facing warning so demos don't confuse the
+            # approximate live scores with the batch pipeline metrics.
+            print(
+                "  NOTE: live AI inference is a streaming approximation. "
+                "For authoritative model metrics run the batch pipeline."
+            )
         return self._models_loaded
 
     def init_storage(self) -> bool:
