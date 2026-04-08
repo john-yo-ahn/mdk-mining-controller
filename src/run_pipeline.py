@@ -263,7 +263,7 @@ def main():
     print("=" * 70)
 
     lstm_model = AnomalyDetector(
-        input_dim=6, seq_len=60, hidden_dim=64, latent_dim=32,
+        input_dim=9, seq_len=60, hidden_dim=64, latent_dim=32,
         n_layers=2, n_epochs=30, batch_size=256,
         early_stopping_patience=4,
     )

@@ -131,13 +131,24 @@ def check_model_load():
     assert lstm.model_ is not None
     assert lstm.threshold_ is not None
     assert lstm.threshold_ > 0
-    assert lstm.feature_mean_ is not None, "persistent scaler missing"
-    assert lstm.feature_std_ is not None
-    assert lstm.feature_mean_.shape == (6,), f"scaler mean shape {lstm.feature_mean_.shape}"
+    # Scaler schema v2: per-hardware-model dict + global fallback.
+    # At least one of the two must be populated after load().
+    assert (
+        lstm.feature_scalers_ or lstm.global_fallback_mean_ is not None
+    ), "persistent scaler missing"
+    if lstm.global_fallback_mean_ is not None:
+        assert lstm.global_fallback_mean_.shape == (9,), (
+            f"global fallback mean shape {lstm.global_fallback_mean_.shape}"
+        )
+    for name, (m, s) in lstm.feature_scalers_.items():
+        assert m.shape == (9,), f"{name} mean shape {m.shape}"
+        assert s.shape == (9,), f"{name} std shape {s.shape}"
     assert lstm.feature_names_ is not None
-    assert len(lstm.feature_names_) == 6
+    assert len(lstm.feature_names_) == 9, (
+        f"expected 9 features, got {len(lstm.feature_names_)}"
+    )
 
-    return f"XGB threshold={xgb.threshold_:.4f}, LSTM threshold={lstm.threshold_:.6f}, scaler present"
+    return f"XGB threshold={xgb.threshold_:.4f}, LSTM threshold={lstm.threshold_:.6f}, scaler v2 ({len(lstm.feature_scalers_)} per-model)"
 
 
 @check("4. Metadata sidecars exist and parse")
@@ -158,7 +169,7 @@ def check_metadata_sidecars():
     assert lstm_meta is not None, "LSTM sidecar missing"
     assert lstm_meta["schema_version"] == 1
     assert lstm_meta["model_type"] == "lstm_autoencoder"
-    assert lstm_meta["feature_count"] == 6
+    assert lstm_meta["feature_count"] == 9
 
     return f"XGB AUC recorded: {xgb_meta['val_metrics'].get('auc_roc', '?'):.3f}"
 
@@ -394,7 +405,10 @@ def check_ai_bridge_smoke():
     assert ai.load_models(), "load_models returned False"
     assert len(ai.xgb_features) == 152
     assert ai.lstm_model is not None
-    assert ai.lstm_model.feature_mean_ is not None
+    assert (
+        ai.lstm_model.feature_scalers_
+        or ai.lstm_model.global_fallback_mean_ is not None
+    ), "LSTM persistent scaler missing after load_models"
 
     ai.register_miner("MNR-TEST", "Antminer S21 Pro", 234.0)
     buf = ai.buffers["MNR-TEST"]

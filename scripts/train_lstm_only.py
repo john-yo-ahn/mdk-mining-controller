@@ -82,7 +82,7 @@ def main():
     )
 
     lstm_model = AnomalyDetector(
-        input_dim=6, seq_len=60, hidden_dim=64, latent_dim=32,
+        input_dim=9, seq_len=60, hidden_dim=64, latent_dim=32,
         n_layers=2, n_epochs=30, batch_size=256,
         early_stopping_patience=4,
     )
@@ -102,9 +102,9 @@ def main():
     print("Building test sequences (alive failures + dead failures + healthy held out)...")
     t0 = time.time()
     X_fail_alive_seq = lstm_model.prepare_sequences(failure_test_alive, stride=5) \
-        if len(failure_test_alive) else np.empty((0, 60, 6), dtype=np.float32)
+        if len(failure_test_alive) else np.empty((0, 60, 9), dtype=np.float32)
     X_fail_dead_seq = lstm_model.prepare_sequences(failure_test_dead, stride=5) \
-        if len(failure_test_dead) else np.empty((0, 60, 6), dtype=np.float32)
+        if len(failure_test_dead) else np.empty((0, 60, 9), dtype=np.float32)
     X_health_test_seq = lstm_model.prepare_sequences(healthy_test, stride=5)
     print(
         f"  {len(X_fail_alive_seq):,} alive + {len(X_fail_dead_seq):,} dead failure "
@@ -225,7 +225,7 @@ def main():
         val_metrics=lstm_val_metrics,
         feature_names=lstm_model.feature_names_,
         training_config={
-            "input_dim": 6,
+            "input_dim": 9,
             "seq_len": 60,
             "hidden_dim": 64,
             "latent_dim": 32,

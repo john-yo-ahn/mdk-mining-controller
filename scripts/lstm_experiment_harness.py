@@ -323,7 +323,7 @@ def run(cfg: ModeConfig) -> dict:
     )
 
     lstm = AnomalyDetector(
-        input_dim=6, seq_len=60,
+        input_dim=9, seq_len=60,
         hidden_dim=cfg.hidden_dim, latent_dim=cfg.latent_dim,
         n_layers=2, n_epochs=cfg.n_epochs, batch_size=cfg.batch_size,
         early_stopping_patience=cfg.patience,
@@ -337,9 +337,9 @@ def run(cfg: ModeConfig) -> dict:
     X_val = lstm.prepare_sequences(healthy_val, stride=cfg.stride)
     X_health_test = lstm.prepare_sequences(healthy_test_eval, stride=cfg.stride)
     X_fail_alive = lstm.prepare_sequences(failure_alive_eval, stride=cfg.stride) \
-        if len(failure_alive_eval) else np.empty((0, 60, 6), dtype=np.float32)
+        if len(failure_alive_eval) else np.empty((0, 60, 9), dtype=np.float32)
     X_fail_dead = lstm.prepare_sequences(failure_dead_eval, stride=cfg.stride) \
-        if len(failure_dead_eval) else np.empty((0, 60, 6), dtype=np.float32)
+        if len(failure_dead_eval) else np.empty((0, 60, 9), dtype=np.float32)
     print(
         f"  Sequences built in {time.time()-t0:.1f}s: "
         f"train={len(X_train):,} val={len(X_val):,} "

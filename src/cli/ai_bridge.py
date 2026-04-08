@@ -161,7 +161,7 @@ class MinerBuffer:
     def export_lstm_sequence(self, seq_len: int = LSTM_SEQ_LEN) -> Optional[np.ndarray]:
         """
         Export the last seq_len readings as a normalized numpy array
-        for LSTM-AE inference. Returns shape (1, seq_len, 6) or None
+        for LSTM-AE inference. Returns shape (1, seq_len, 9) or None
         if the buffer doesn't have enough data yet.
 
         Uses the PERSISTENT scaler (lstm_scaler_mean/std, populated by
@@ -170,6 +170,16 @@ class MinerBuffer:
         threshold the model was calibrated against. If the scaler
         hasn't been propagated yet, falls back to per-buffer
         normalization with a warning.
+
+        The 9 features are the 6 raw sensor channels plus 3
+        physics-derived columns (efficiency_jth, temp_delta_c,
+        power_per_ghz), matching AnomalyDetector.DEFAULT_FEATURES
+        order. The derived columns are computed inline here rather
+        than stored in the buffer so the buffer schema remains
+        purely raw telemetry and the derivation logic has exactly
+        one owner (src/models/lstm_autoencoder.py:_ensure_derived_columns
+        for the batch path, this method for the live path, with
+        identical formulas).
         """
         if self.length < seq_len:
             return None
@@ -181,10 +191,23 @@ class MinerBuffer:
         pwr = self._ordered(self.power_w)[-seq_len:]
         amb = self._ordered(self.ambient_temperature_c)[-seq_len:]
 
+        # Derived physics — must match _ensure_derived_columns in
+        # src/models/lstm_autoencoder.py bit-for-bit. Any change
+        # to either implementation must be mirrored in the other or
+        # live inference will drift from batch training.
+        efficiency_jth = pwr / np.maximum(hr.astype(np.float32), 1.0)
+        temp_delta_c = temp.astype(np.float32) - amb.astype(np.float32)
+        power_per_ghz = pwr / np.maximum(freq.astype(np.float32), 1.0)
+
         # Column order must match AnomalyDetector.DEFAULT_FEATURES:
         # [clock_frequency_mhz, voltage_v, hashrate_th, temperature_c,
-        #  power_w, ambient_temperature_c]
-        raw = np.stack([freq, volt, hr, temp, pwr, amb], axis=1)  # (seq_len, 6)
+        #  power_w, ambient_temperature_c,
+        #  efficiency_jth, temp_delta_c, power_per_ghz]
+        raw = np.stack(
+            [freq, volt, hr, temp, pwr, amb,
+             efficiency_jth, temp_delta_c, power_per_ghz],
+            axis=1,
+        )  # (seq_len, 9)
 
         if self.lstm_scaler_mean is not None and self.lstm_scaler_std is not None:
             normalized = (raw - self.lstm_scaler_mean) / self.lstm_scaler_std
@@ -195,7 +218,7 @@ class MinerBuffer:
             std[std == 0] = 1
             normalized = (raw - mean) / std
 
-        return normalized.reshape(1, seq_len, 6).astype(np.float32)
+        return normalized.reshape(1, seq_len, 9).astype(np.float32)
 
     # Minimum buffer length before compute_features returns a result.
     # Needs to cover at least the 6-hour rolling window used by the

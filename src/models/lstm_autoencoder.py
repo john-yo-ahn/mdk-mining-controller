@@ -105,17 +105,71 @@ if HAS_TORCH:
             return self.decoder(z)
 
 
+def _ensure_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the three physics-derived columns the LSTM-AE expects as
+    part of its 9-feature input vector: ``efficiency_jth``,
+    ``temp_delta_c``, ``power_per_ghz``. Idempotent — if a column
+    already exists (because the feature cache already carries it)
+    it is left alone. Returns a copy only if at least one column
+    was added.
+
+    Why these three:
+      * efficiency_jth (power_w / hashrate_th) — the primary
+        degradation signal. J/TH drift is what XGBoost's top
+        features all measure, and it catches slow-building PSU
+        and cooling failures well before the raw sensors show a
+        discrete alarm.
+      * temp_delta_c (temperature_c - ambient_temperature_c) —
+        decouples chip self-heating from ambient-driven swings,
+        which matters especially for coolant-restriction failures
+        where the chip runs hot even though ambient is cool.
+      * power_per_ghz (power_w / clock_frequency_mhz) — a per-chip
+        work proxy that picks up firmware-oscillation / clock-
+        glitch failures that leave hashrate intact but distort
+        the power draw pattern.
+    """
+    out = df
+    if "efficiency_jth" not in out.columns:
+        out = out.copy()
+        out["efficiency_jth"] = (
+            out["power_w"].astype(np.float32)
+            / np.maximum(out["hashrate_th"].astype(np.float32), 1.0)
+        )
+    if "temp_delta_c" not in out.columns:
+        if out is df:
+            out = out.copy()
+        out["temp_delta_c"] = (
+            out["temperature_c"].astype(np.float32)
+            - out["ambient_temperature_c"].astype(np.float32)
+        )
+    if "power_per_ghz" not in out.columns:
+        if out is df:
+            out = out.copy()
+        out["power_per_ghz"] = (
+            out["power_w"].astype(np.float32)
+            / np.maximum(out["clock_frequency_mhz"].astype(np.float32), 1.0)
+        )
+    return out
+
+
 class AnomalyDetector:
     """High-level wrapper for LSTM-Autoencoder anomaly detection."""
 
     DEFAULT_FEATURES = [
+        # Raw sensor channels
         "clock_frequency_mhz", "voltage_v", "hashrate_th",
         "temperature_c", "power_w", "ambient_temperature_c",
+        # Physics-derived (computed inline by _ensure_derived_columns
+        # so the feature cache doesn't need a schema bump).
+        "efficiency_jth",
+        "temp_delta_c",
+        "power_per_ghz",
     ]
 
     def __init__(
         self,
-        input_dim: int = 6,
+        input_dim: int = 9,
         seq_len: int = 60,
         hidden_dim: int = 64,
         latent_dim: int = 32,
@@ -276,6 +330,7 @@ class AnomalyDetector:
         training rows, which in production smeared four hardware
         families together and gave the AE nothing to overfit cleanly.
         """
+        df = _ensure_derived_columns(df)
         if feature_columns is None:
             feature_columns = [c for c in self.DEFAULT_FEATURES if c in df.columns]
         self.feature_names_ = list(feature_columns)
@@ -342,6 +397,7 @@ class AnomalyDetector:
         fit_scaler on the training set first.
         Returns shape (n_sequences, seq_len, n_features).
         """
+        df = _ensure_derived_columns(df)
         if feature_columns is None:
             feature_columns = list(
                 self.feature_names_
