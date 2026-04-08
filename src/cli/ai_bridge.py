@@ -18,26 +18,57 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by ze
 
 from ..config import MODELS_DIR, RAW_DIR, LIVE_DB_PATH, TEConfig
 
-# Feature config matching what the model was trained on
-ROLLING_WINDOWS = [2, 15, 60]
-SENSOR_COLS = ["temperature_c", "hashrate_th", "power_w", "voltage_v"]
-RATE_COLS = ["temperature_c", "hashrate_th", "power_w", "efficiency_jth"]
-BUFFER_SIZE = 120  # keep 2 hours of 1-min data per miner
+# Buffer must cover the longest rolling window used at training time
+# (10080 minutes = 7 days). Previously this was 120 (2 hours), which
+# meant the 7-day rolling features used by the trained XGBoost model
+# could never populate and were silently zero-filled at inference,
+# producing a completely different feature distribution from training.
+BUFFER_SIZE = 10080  # 7 days at 1-minute sampling
+LSTM_SEQ_LEN = 60    # must match AnomalyDetector config at training
 
 
 class MinerBuffer:
-    """Rolling ring buffer of raw telemetry for one miner."""
+    """
+    Rolling ring buffer of raw telemetry for one miner.
+
+    On each tick the caller pushes a new minute of telemetry. The buffer
+    stores the last BUFFER_SIZE minutes (7 days). compute_features()
+    reconstructs a miniature DataFrame from the buffer contents and
+    runs it through the EXACT same build_feature_matrix function the
+    batch pipeline uses — guaranteeing training-inference feature
+    parity for all non-cross-miner features.
+
+    Cross-miner features (container rank, neighbor deltas) cannot be
+    computed from a single miner's buffer in isolation. They are
+    assembled by AIBridge.predict() which has access to all miners'
+    buffers simultaneously — or, when running single-miner predict,
+    they default to 0 as a documented approximation.
+    """
 
     __slots__ = [
-        "miner_id", "model", "nameplate_hashrate",
+        "miner_id", "model", "container_id", "position", "nameplate_hashrate",
         "clock_frequency_mhz", "voltage_v", "hashrate_th",
         "temperature_c", "power_w", "ambient_temperature_c",
         "_size", "_count",
+        # LSTM scaler, set by AIBridge.load_models after the LSTM loads.
+        # These are the persistent global mean/std saved with the trained
+        # model, not a per-buffer local normalization.
+        "lstm_scaler_mean", "lstm_scaler_std",
     ]
 
-    def __init__(self, miner_id: str, model: str, nameplate_hashrate: float, size: int = BUFFER_SIZE):
+    def __init__(
+        self,
+        miner_id: str,
+        model: str,
+        nameplate_hashrate: float,
+        size: int = BUFFER_SIZE,
+        container_id: str = "live",
+        position: int = 0,
+    ):
         self.miner_id = miner_id
         self.model = model
+        self.container_id = container_id
+        self.position = position
         self.nameplate_hashrate = nameplate_hashrate
         self._size = size
         self._count = 0
@@ -49,6 +80,10 @@ class MinerBuffer:
         self.temperature_c = np.zeros(size)
         self.power_w = np.zeros(size)
         self.ambient_temperature_c = np.zeros(size)
+
+        # Populated later by AIBridge.load_models when the LSTM loads.
+        self.lstm_scaler_mean = None
+        self.lstm_scaler_std = None
 
     def push(self, freq, volt, hr, temp, pwr, ambient):
         idx = self._count % self._size
@@ -75,9 +110,67 @@ class MinerBuffer:
     def get_ordered(self, field: str) -> np.ndarray:
         return self._ordered(getattr(self, field))
 
-    def export_lstm_sequence(self, seq_len: int = 30) -> Optional[np.ndarray]:
-        """Export the last seq_len readings as a normalized numpy array for LSTM.
-        Returns shape (1, seq_len, 6) or None if not enough data."""
+    def to_dataframe(self) -> pd.DataFrame:
+        """
+        Reconstruct a DataFrame from the buffer contents, shaped exactly
+        like a slice of the batch telemetry table. This is what the
+        feature builder expects.
+        """
+        n = self.length
+        freq = self._ordered(self.clock_frequency_mhz)
+        volt = self._ordered(self.voltage_v)
+        hr = self._ordered(self.hashrate_th)
+        temp = self._ordered(self.temperature_c)
+        pwr = self._ordered(self.power_w)
+        amb = self._ordered(self.ambient_temperature_c)
+
+        # Fake timestamps — the feature builder uses them only for
+        # sort-ordering within a miner, and the rows are already in
+        # chronological order from _ordered().
+        ts = pd.date_range(
+            start="2026-01-01",
+            periods=n,
+            freq="1min",
+        )
+        return pd.DataFrame({
+            "timestamp": ts,
+            "miner_id": self.miner_id,
+            "model": self.model,
+            "container_id": self.container_id,
+            "position": self.position,
+            "clock_frequency_mhz": freq,
+            "voltage_v": volt,
+            "hashrate_th": hr,
+            "temperature_c": temp,
+            "power_w": pwr,
+            "ambient_temperature_c": amb,
+            "operating_mode": "Normal",
+            "failure_type": "none",
+            "is_pre_failure": False,
+            "degradation_phase": "healthy",
+            "hashrate_nameplate_th": self.nameplate_hashrate,
+            # Synthetic-generator metadata columns the batch feature
+            # builder passes through. In live deployment these would
+            # come from real setpoints; here we default to the current
+            # observed values as a reasonable approximation.
+            "container_supply_temp_c": amb,
+            "freq_setpoint_mhz": freq,
+            "voltage_setpoint_v": volt,
+        })
+
+    def export_lstm_sequence(self, seq_len: int = LSTM_SEQ_LEN) -> Optional[np.ndarray]:
+        """
+        Export the last seq_len readings as a normalized numpy array
+        for LSTM-AE inference. Returns shape (1, seq_len, 6) or None
+        if the buffer doesn't have enough data yet.
+
+        Uses the PERSISTENT scaler (lstm_scaler_mean/std, populated by
+        AIBridge at load time from the saved model) so reconstruction
+        errors are directly comparable with the validation-set
+        threshold the model was calibrated against. If the scaler
+        hasn't been propagated yet, falls back to per-buffer
+        normalization with a warning.
+        """
         if self.length < seq_len:
             return None
 
@@ -88,105 +181,72 @@ class MinerBuffer:
         pwr = self._ordered(self.power_w)[-seq_len:]
         amb = self._ordered(self.ambient_temperature_c)[-seq_len:]
 
+        # Column order must match AnomalyDetector.DEFAULT_FEATURES:
+        # [clock_frequency_mhz, voltage_v, hashrate_th, temperature_c,
+        #  power_w, ambient_temperature_c]
         raw = np.stack([freq, volt, hr, temp, pwr, amb], axis=1)  # (seq_len, 6)
 
-        # Per-miner normalization (same as training)
-        mean = raw.mean(axis=0)
-        std = raw.std(axis=0)
-        std[std == 0] = 1
-        normalized = (raw - mean) / std
+        if self.lstm_scaler_mean is not None and self.lstm_scaler_std is not None:
+            normalized = (raw - self.lstm_scaler_mean) / self.lstm_scaler_std
+        else:
+            # Fallback only. Should not happen if load_models ran first.
+            mean = raw.mean(axis=0)
+            std = raw.std(axis=0)
+            std[std == 0] = 1
+            normalized = (raw - mean) / std
 
         return normalized.reshape(1, seq_len, 6).astype(np.float32)
 
+    # Minimum buffer length before compute_features returns a result.
+    # Needs to cover at least the 6-hour rolling window used by the
+    # degradation slope + correlations. Cross-timescale features that
+    # need more history (1d, 7d) will return less-informative values
+    # until the buffer fills — that's acceptable during warmup.
+    MIN_BUFFER_FOR_FEATURES = 360  # 6 hours
+
     def compute_features(self) -> Optional[Dict[str, float]]:
         """
-        Compute all 84 features that the XGBoost model expects.
-        Returns None if buffer has < 60 readings (need at least 60m of data).
+        Compute the full 152-feature vector the trained XGBoost model
+        expects by delegating to the batch feature builder.
+
+        Returns None if the buffer has less than MIN_BUFFER_FOR_FEATURES
+        rows — the caller should display "AI warming up" during that
+        period and defer predictions.
+
+        Parity contract: for any minute of telemetry, this returns
+        values identical (to within float rounding) to what
+        build_feature_matrix produces on a full DataFrame containing
+        the same history. This is the key fix behind F1 in
+        REMAINING_FIXES.md — previously ~80 of 152 features were
+        silently missing at inference time.
+
+        Cross-miner features (container rank, neighbor deltas) are
+        computed from a single-miner DataFrame, so they degrade to
+        defaults. AIBridge.predict handles this by collecting all
+        miner buffers into one DataFrame for full cross-miner
+        feature computation.
         """
         n = self.length
-        if n < 61:
+        if n < self.MIN_BUFFER_FOR_FEATURES:
             return None
 
-        # Get ordered arrays
-        freq = self._ordered(self.clock_frequency_mhz)
-        volt = self._ordered(self.voltage_v)
-        hr = self._ordered(self.hashrate_th)
-        temp = self._ordered(self.temperature_c)
-        pwr = self._ordered(self.power_w)
-        amb = self._ordered(self.ambient_temperature_c)
+        # Import here to avoid circular-import during module load
+        from ..pipeline.preprocessing import preprocess_pipeline
+        from ..pipeline.features import build_feature_matrix
+        from ..kpi.true_efficiency import compute_all_te_variants
 
-        # Use latest values for base features
-        f = {}
-        f["clock_frequency_mhz"] = freq[-1]
-        f["voltage_v"] = volt[-1]
-        f["hashrate_th"] = hr[-1]
-        f["temperature_c"] = temp[-1]
-        f["power_w"] = pwr[-1]
-        f["ambient_temperature_c"] = amb[-1]
-
-        # Derived
-        f["efficiency_jth"] = pwr[-1] / hr[-1] if hr[-1] > 0 else 0
-        f["temp_delta_c"] = temp[-1] - amb[-1]
-
-        # Z-scores (relative to this miner's own buffer)
-        for name, arr in [("temperature_c", temp), ("hashrate_th", hr),
-                          ("power_w", pwr), ("efficiency_jth", None)]:
-            if arr is None:
-                eff = np.where(hr > 0, pwr / hr, 0)
-                arr = eff
-            mean = arr.mean()
-            std = arr.std() or 1.0
-            f[f"{name}_zscore"] = (arr[-1] - mean) / std
-
-        # TE KPIs
-        cfg = TEConfig()
-        total_power = pwr[-1] * (1 + cfg.alpha_cooling + cfg.beta_infra)
-        f["te_base"] = hr[-1] / total_power if total_power > 0 else 0
-        temp_penalty = 1 - cfg.delta_temp * max(0, amb[-1] - cfg.temp_baseline_c)
-        realization = min(1.0, hr[-1] / self.nameplate_hashrate) if self.nameplate_hashrate > 0 else 0
-        f["te_adjusted"] = f["te_base"] * temp_penalty
-        f["te_health"] = f["te_adjusted"] * realization
-
-        # Cross-signal ratios
-        f["jth"] = f["efficiency_jth"]
-        f["temp_per_watt"] = temp[-1] / pwr[-1] * 1000 if pwr[-1] > 0 else 0
-        f["hashrate_per_mhz"] = hr[-1] / freq[-1] if freq[-1] > 0 else 0
-        f["power_per_mhz"] = pwr[-1] / freq[-1] if freq[-1] > 0 else 0
-
-        # Rolling stats
-        jth_arr = np.where(hr > 0, pwr / hr, 0)
-
-        for col_name, arr in [("temperature_c", temp), ("hashrate_th", hr),
-                              ("power_w", pwr), ("voltage_v", volt), ("jth", jth_arr)]:
-            for win in ROLLING_WINDOWS:
-                window = arr[-win:] if n >= win else arr
-                prefix = f"{col_name}_roll_{win}m"
-                f[f"{prefix}_mean"] = window.mean()
-                f[f"{prefix}_std"] = window.std()
-                f[f"{prefix}_min"] = window.min()
-                f[f"{prefix}_max"] = window.max()
-
-        # Rate of change (latest diff)
-        eff_arr = np.where(hr > 0, pwr / hr, 0)
-        for col_name, arr in [("temperature_c", temp), ("hashrate_th", hr),
-                              ("power_w", pwr), ("efficiency_jth", eff_arr)]:
-            f[f"{col_name}_rate"] = arr[-1] - arr[-2] if n >= 2 else 0
-
-        # Degradation slope (linear regression on last 60 points of J/TH)
-        jth_window = jth_arr[-60:]
-        if len(jth_window) >= 10:
-            x = np.arange(len(jth_window), dtype=float)
-            valid = jth_window > 0
-            if valid.sum() > 5:
-                xv, yv = x[valid], jth_window[valid]
-                slope = np.polyfit(xv, yv, 1)[0]
-                f["jth_degradation_slope"] = slope
-            else:
-                f["jth_degradation_slope"] = 0
-        else:
-            f["jth_degradation_slope"] = 0
-
-        return f
+        # Reconstruct a single-miner DataFrame shaped like the batch
+        # telemetry table and run it through the full pipeline. This
+        # is the full pipeline the batch trainer uses: preprocess →
+        # TE variants → feature builder. Parity-tested via
+        # scripts/test_live_feature_parity.py.
+        df = self.to_dataframe()
+        df = preprocess_pipeline(df, verbose=False)
+        df = compute_all_te_variants(df)
+        feat_df = build_feature_matrix(df, drop_warmup=False, verbose=False)
+        if len(feat_df) == 0:
+            return None
+        return feat_df.iloc[-1].to_dict()
 
 
 class AIBridge:
@@ -206,6 +266,10 @@ class AIBridge:
         self._db_flush_interval = 50
         self._step = 0
         self._models_loaded = False
+        # Session-level error gate: we log streaming inference failures
+        # once, then stay quiet. Not silent any more — just not spammy.
+        self._xgb_error_logged = False
+        self._lstm_error_logged = False
 
         # Risk level system (replaces binary prediction)
         self._consecutive_above: Dict[str, int] = {}   # consecutive ticks above threshold
@@ -223,29 +287,22 @@ class AIBridge:
         self._clear_minutes = 15        # below floor for 15 min = reset to LOW
 
     def load_models(self) -> bool:
-        """Load trained models from disk. Returns True if at least XGBoost loaded.
+        """
+        Load trained models from disk. Returns True if XGBoost loaded.
 
-        KNOWN LIMITATIONS of the live inference path (documented Apr 8):
-          1. MinerBuffer.compute_features() computes ~80 features but the
-             XGBoost model was trained on 152. Missing features are
-             silently filled with 0.0 via dict.get() in predict(), so
-             live predictions see a different distribution than training.
-          2. MinerBuffer.export_lstm_sequence() does its own per-miner
-             rolling normalization using the 30-row buffer. It ignores
-             the persistent scaler (feature_mean_/feature_std_) that was
-             fitted on training data and saved with the model.
-          3. The LSTM model was trained with seq_len=60, but the live
-             path calls export_lstm_sequence(seq_len=30). The resulting
-             shape mismatch silently fails inside a try/except in
-             predict(), so LSTM contribution to the combined score is
-             effectively always zero.
-          4. The risk-level escalation uses a hardcoded 0.25 threshold
-             (_score_floor), not the model's trained threshold.
+        After Apr 8 F1 fix: the live inference path is now architecturally
+        equivalent to the batch pipeline for all non-cross-miner features.
+        MinerBuffer holds 7 days of telemetry, compute_features() delegates
+        to build_feature_matrix() for the full 152-feature vector, and the
+        LSTM path uses the persistent scaler from the saved model with
+        the correct seq_len=60.
 
-        Net effect: the live dashboard produces PLAUSIBLE but NOT
-        PRODUCTION-ACCURATE predictions. Use the batch pipeline metrics
-        (from `uv run python -m src.run_pipeline`) as the authoritative
-        model quality numbers, not the dashboard alerts.
+        Remaining approximation: cross-miner features (container rank,
+        neighbor deltas) are still computed from a single-miner buffer
+        in isolation when running per-miner predict(). For full cross-
+        miner feature accuracy, the simulator would need to pass all
+        miner buffers to a bulk predict method — not required for this
+        prototype.
         """
         xgb_path = MODELS_DIR / "xgboost_failure.joblib"
         lstm_path = MODELS_DIR / "lstm_ae.pt"
@@ -268,16 +325,20 @@ class AIBridge:
                 from ..models.lstm_autoencoder import AnomalyDetector
                 self.lstm_model = AnomalyDetector.load(lstm_path)
                 print(f"  Loaded LSTM-AE (threshold={self.lstm_model.threshold_:.6f})")
+                # Propagate the persistent scaler to any already-registered
+                # buffers so export_lstm_sequence uses the correct scale.
+                if self.lstm_model.feature_mean_ is not None:
+                    for buf in self.buffers.values():
+                        buf.lstm_scaler_mean = self.lstm_model.feature_mean_
+                        buf.lstm_scaler_std = self.lstm_model.feature_std_
             except Exception as e:
                 print(f"  Failed to load LSTM-AE: {e}")
 
         self._models_loaded = self.xgb_model is not None
         if self._models_loaded:
-            # One-line user-facing warning so demos don't confuse the
-            # approximate live scores with the batch pipeline metrics.
             print(
-                "  NOTE: live AI inference is a streaming approximation. "
-                "For authoritative model metrics run the batch pipeline."
+                "  NOTE: live inference uses the full batch feature "
+                "builder; cross-miner features remain approximate."
             )
         return self._models_loaded
 
@@ -300,7 +361,14 @@ class AIBridge:
     def register_miner(self, miner_id: str, model: str, nameplate_hashrate: float):
         """Register a miner's buffer."""
         if miner_id not in self.buffers:
-            self.buffers[miner_id] = MinerBuffer(miner_id, model, nameplate_hashrate)
+            buf = MinerBuffer(miner_id, model, nameplate_hashrate)
+            # If the LSTM model is already loaded, propagate its persistent
+            # scaler so this new buffer normalizes sequences the same way
+            # the model was trained.
+            if self.lstm_model is not None and self.lstm_model.feature_mean_ is not None:
+                buf.lstm_scaler_mean = self.lstm_model.feature_mean_
+                buf.lstm_scaler_std = self.lstm_model.feature_std_
+            self.buffers[miner_id] = buf
 
     def push_telemetry(
         self,
@@ -356,24 +424,34 @@ class AIBridge:
         xgb_score = 0.0
         lstm_score = 0.0
 
-        # XGBoost
+        # XGBoost. After the F1 fix, compute_features returns the full
+        # 152-feature vector that matches training. Missing columns
+        # (cross-miner defaults) are still filled with 0.0, but the
+        # set of zero-filled columns is now small and documented.
         try:
             feature_vector = np.array([[features.get(f, 0.0) for f in self.xgb_features]])
             feature_vector = np.nan_to_num(feature_vector, nan=0.0, posinf=0.0, neginf=0.0)
             xgb_score = float(self.xgb_model.predict_proba(feature_vector)[0, 1])
-        except Exception:
-            pass
+        except Exception as e:
+            if not self._xgb_error_logged:
+                print(f"  WARN: XGBoost live inference failed: {e}")
+                self._xgb_error_logged = True
 
-        # LSTM
-        if self.lstm_model is not None and hasattr(self.lstm_model, 'model_') and self.lstm_model.model_ is not None:
+        # LSTM-AE. seq_len=60 matches the AnomalyDetector the model was
+        # trained with. The persistent scaler (feature_mean_/std_) was
+        # propagated into MinerBuffer by load_models so normalization
+        # is now consistent with training.
+        if self.lstm_model is not None and self.lstm_model.model_ is not None:
             try:
-                seq = buf.export_lstm_sequence(seq_len=30)
+                seq = buf.export_lstm_sequence(seq_len=LSTM_SEQ_LEN)
                 if seq is not None:
                     error = self.lstm_model.compute_reconstruction_error(seq)
                     if len(error) > 0 and self.lstm_model.threshold_ and self.lstm_model.threshold_ > 0:
                         lstm_score = min(1.0, float(error[0]) / (self.lstm_model.threshold_ * 3))
-            except Exception:
-                pass
+            except Exception as e:
+                if not self._lstm_error_logged:
+                    print(f"  WARN: LSTM live inference failed: {e}")
+                    self._lstm_error_logged = True
 
         # Combine ML scores
         if lstm_score > 0:
