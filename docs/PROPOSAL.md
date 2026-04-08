@@ -8,6 +8,81 @@
 
 ---
 
+## Status update (April 2026) — what actually shipped
+
+This proposal is the original pitch. Below is a short ledger of what
+was built, what was exceeded, where we deviated, and what's in the
+followup queue. For the canonical results document see
+`docs/TECHNICAL_REPORT.md`; for the implementation-level followup list
+see `docs/REMAINING_FIXES.md`.
+
+**Delivered as proposed:**
+- XGBoost predictive maintenance classifier (binary `is_pre_failure`)
+- LSTM-Autoencoder unsupervised anomaly detector
+- Rule-based dynamic efficiency optimizer with SafetyGuard chokepoint
+- True Efficiency (TE) KPI (base / adjusted / health variants)
+- Feature engineering pipeline (152 features, multi-timescale)
+- Synthetic physics-first telemetry generator
+- CLI dashboard with live fleet simulator
+- Adaptive temporal train/val/test split
+- Honest held-out evaluation with val-tuned thresholds
+
+**Exceeded proposed scope:**
+- Dataset size: 30 miners × 120 days (~5.2 M rows) vs the
+  originally-proposed 50 × 30. The longer time axis lets the 7-day
+  rolling features fully populate.
+- 152 features across 6 rolling-window timescales (2 m / 15 m / 1 h
+  / 6 h / 1 d / 7 d) rather than the 3 windows in the proposal.
+- 7 distinct failure scenarios vs the 5 listed in the proposal
+  (added `coolant_restriction`, `connector_corrosion`,
+  `firmware_oscillation`).
+- Model metadata sidecars alongside every saved model (git commit,
+  training config, val metrics) for auditability.
+- Dual-file DuckDB storage with lock recovery via `lsof`.
+- Per-failure-type detection coverage analysis (see TECHNICAL_REPORT
+  §5.3) rather than the aggregate precision/recall reporting
+  originally planned.
+
+**Deviated from the proposal:**
+- **Pre-failure label definition** was redefined mid-project to use
+  `degradation_phase ∈ {incubation, acceleration}` instead of a
+  fixed 24-hour horizon. The original 24 h window stamped labels on
+  scheduled timestamps that drifted up to 18 days from the actual
+  failure progression, leaving >50% of training positives on
+  actually-healthy telemetry. Details in TECHNICAL_REPORT §2 and the
+  commit `dba8d25` diff of `src/synthetic/generator.py`. Consequence:
+  the model predicts "is this miner currently degrading" rather
+  than "will this miner fail in exactly 24 h" — operationally more
+  useful but not the framing the proposal used.
+- **Optimizer is rule-based, not RL.** The proposal scoped RL as a
+  stretch goal; we chose rule-based for hardware-safety and
+  auditability reasons (see TECHNICAL_REPORT §2.2). RL remains a
+  documented future-work path.
+- **Feature engineering is cached** to `data/processed/features.v{N}.parquet`
+  with an explicit `FEATURES_VERSION` constant. Wasn't in the proposal
+  but was necessary to make iteration tractable — a cold feature
+  build takes ~25 minutes, caches hit is instant.
+
+**In the followup queue** (not shipped, see `docs/REMAINING_FIXES.md`):
+- F1: live CLI inference feature-set mismatch (streaming path
+  computes ~80 of 152 features and silently zeros the rest).
+  Documented and warned about at `AIBridge.load_models()` startup;
+  planned for fix before demo.
+- F12: multi-class XGBoost targeting specific failure types (would
+  close the `psu_degradation` and `coolant_restriction` blind spots
+  currently covered only by LSTM-AE).
+- F14: real MDK API client — gated on a data sharing channel with
+  Tether mining ops.
+
+**Headline results** (30 × 120 held-out test, see TECHNICAL_REPORT §5):
+- XGBoost AUC = 0.801, avg lead time 7.6 days when it catches
+- LSTM-AE separation ratio 2.66×, 2.6% healthy false-alarm rate
+- Combined: **5 of 6 measurable test failures caught** by at least
+  one model, 6× lower false-alarm rate than a simple temperature +
+  hashrate threshold baseline
+
+---
+
 ## 1. Problem Statement
 
 Bitcoin mining profitability depends on two controllable variables: **hardware efficiency (J/TH)** and **energy cost**. In current operations, site operators manually adjust chip frequencies, voltages, and cooling parameters based on experience — a process that doesn't scale across thousands of ASICs and can't react fast enough to changing conditions.
