@@ -280,51 +280,84 @@ def check_detection_timeline():
 @check("9. LSTM reload reproduces sidecar metrics (determinism check)")
 def check_lstm_reproducibility():
     """
-    Determinism check, not a quality check. A fresh reload must reproduce
-    the numbers recorded in the sidecar at training time. The LSTM-AE is
-    a secondary signal in this project — XGBoost carries detection — and
-    its separation ratio on this dataset is weak (the healthy manifold
-    is too broad across miner models for a 32-hidden AE to capture
-    cleanly). What matters for consistency is that reload matches
-    training, so the rest of the pipeline sees the same behavior every
-    time.
+    Determinism check, not a quality check. A fresh reload must
+    reproduce the numbers recorded in the sidecar at training
+    time. The LSTM-AE has been a working secondary detector since
+    the Phase 0-D fix series (commits f4e9d82..8098ae3) — sep_alive
+    ≈ 6.6x at full production scale. What matters for consistency
+    is that the reload path reproduces the training-time numbers
+    exactly, so the rest of the pipeline sees the same behavior
+    every time.
+
+    Computation matches scripts/train_lstm_only.py exactly:
+    filter_alive_rows on healthy_test, split failure_test into
+    alive vs dead by the same hashrate/voltage thresholds,
+    compute sep_alive = mean_err(failure_alive) / mean_err(healthy).
+    Compared against sidecar key test_separation_ratio_alive.
     """
     from src.config import PROCESSED_DIR, MODELS_DIR
     from src.pipeline.features import split_temporal_tvt, FEATURES_VERSION
-    from src.models.lstm_autoencoder import AnomalyDetector
+    from src.models.lstm_autoencoder import AnomalyDetector, filter_alive_rows
     from src.models.metadata import load_model_metadata
 
     df = pd.read_parquet(PROCESSED_DIR / f"features.v{FEATURES_VERSION}.parquet")
     _, _, test_df = split_temporal_tvt(df, 0.55, 0.15)
 
     lstm = AnomalyDetector.load()
-    healthy_test = test_df[test_df["failure_type"] == "none"]
-    failure_test = test_df[test_df["failure_type"] != "none"]
 
-    X_fail = lstm.prepare_sequences(failure_test, stride=5)
-    X_healthy = lstm.prepare_sequences(healthy_test, stride=5)
-    assert len(X_fail) > 0 and len(X_healthy) > 0
+    # Match the trainer's filtering exactly: healthy is alive-only,
+    # failure is split into alive vs dead. Both sides use the same
+    # hashrate > 1.0 AND voltage > 0.05 liveness mask.
+    healthy_test = filter_alive_rows(test_df[test_df["failure_type"] == "none"])
+    failure_test = test_df[test_df["failure_type"] != "none"].reset_index(drop=True)
+    fail_alive_mask = (
+        (failure_test["hashrate_th"] > 1.0)
+        & (failure_test["voltage_v"] > 0.05)
+    )
+    failure_alive = failure_test[fail_alive_mask].reset_index(drop=True)
 
-    fail_err = lstm.compute_reconstruction_error(X_fail)
-    health_err = lstm.compute_reconstruction_error(X_healthy)
-    sep = float(fail_err.mean() / max(health_err.mean(), 1e-10))
-    far = float((health_err > lstm.threshold_).mean())
-    det_rate = float((fail_err > lstm.threshold_).mean())
+    X_fail_alive = lstm.prepare_sequences(failure_alive, stride=5)
+    X_healthy_all = lstm.prepare_sequences(healthy_test, stride=5)
+    assert len(X_fail_alive) > 0, "no alive failure sequences in test set"
+    assert len(X_healthy_all) > 0, "no healthy sequences in test set"
+
+    # Match the trainer's burn-in / eval split exactly: the first 20%
+    # of test-healthy sequences are the calibration window (reserved
+    # in train_lstm_only.py, not counted toward the sidecar metrics),
+    # and the remaining 80% is the evaluation set. Reading sidecar
+    # burn_in_size lets us match the trainer across any retune of
+    # the 20% default.
+    meta = load_model_metadata(MODELS_DIR / "lstm_ae.pt")
+    n_burn = int(meta["val_metrics"].get("burn_in_size", len(X_healthy_all) // 5))
+    n_burn = min(n_burn, len(X_healthy_all))
+    X_healthy_eval = X_healthy_all[n_burn:]
+    assert len(X_healthy_eval) > 0, "burn-in slice consumed all healthy test sequences"
+
+    fa_err = lstm.compute_reconstruction_error(X_fail_alive)
+    h_err = lstm.compute_reconstruction_error(X_healthy_eval)
+    sep_alive = float(fa_err.mean() / max(h_err.mean(), 1e-10))
+    far = float((h_err > lstm.threshold_).mean())
+    det_alive = float((fa_err > lstm.threshold_).mean())
 
     # Sidecar must match within float noise. If it doesn't, training
     # was using a different computation path than reload — exactly the
-    # MPS batch_size bug we fixed in compute_reconstruction_error.
-    meta = load_model_metadata(MODELS_DIR / "lstm_ae.pt")
-    recorded_sep = meta["val_metrics"].get("test_separation_ratio", None)
-    if recorded_sep is not None:
-        drift = abs(sep - recorded_sep)
-        assert drift < 0.01, (
-            f"reload drift from sidecar: fresh={sep:.3f} meta={recorded_sep:.3f}. "
-            "This is the MPS batch-size bug reappearing — compute_reconstruction_error "
-            "must force CPU inference."
-        )
+    # MPS batch_size bug we fixed in compute_reconstruction_error, or
+    # a silent drift in the per-model scaler lookup, or filter semantics
+    # diverging from the trainer.
+    recorded = meta["val_metrics"].get("test_separation_ratio_alive", None)
+    assert recorded is not None, (
+        "sidecar missing test_separation_ratio_alive — did train_lstm_only.py "
+        "write the Phase B/C/D metrics?"
+    )
+    drift = abs(sep_alive - recorded)
+    assert drift < 0.01, (
+        f"reload drift from sidecar: fresh={sep_alive:.3f} meta={recorded:.3f}. "
+        "Either the MPS batch-size bug is back (compute_reconstruction_error "
+        "must force CPU inference), or the per-model scaler lookup is drifting, "
+        "or the training liveness filter doesn't match the reload filter."
+    )
 
-    return f"sep={sep:.2f}x FAR={far:.1%} det={det_rate:.1%} (matches sidecar)"
+    return f"sep_alive={sep_alive:.2f}x FAR={far:.1%} det_alive={det_alive:.1%} (matches sidecar)"
 
 
 @check("10. Live feature parity still passes (scripts/test_live_feature_parity)")
