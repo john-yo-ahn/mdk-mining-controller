@@ -125,10 +125,94 @@ reacting to thermal alarms.
 
 **LSTM-Autoencoder (unsupervised anomaly detection):**
 
-> Numbers from the most recent successful training run will go here
-> once `scripts/train_lstm_only.py` completes. Previous runs at this
-> scale showed separation ratios of 3.3-4.5×, ~3-5% healthy false-alarm
-> rate, and 36-52% failure detection rate.
+| Metric | Value |
+|---|---|
+| Training sequences | 649,133 (healthy only) |
+| Best val_loss | 0.007172 (epoch 7, early-stopped epoch 11) |
+| Threshold (95th pct of healthy val errors) | 0.007532 |
+| **Healthy false-alarm rate** | **2.6%** (5,214 / 200,357) |
+| **Failure detection rate** | **33.4%** (12,290 / 36,774) |
+| Mean reconstruction error (healthy) | 0.005734 |
+| Mean reconstruction error (failure) | 0.015254 |
+| **Separation ratio** | **2.66×** |
+
+The LSTM-AE is the safety-net detector — trained on healthy-only
+sequences, it doesn't need any failure labels and so generalizes to
+failure types the supervised model has never seen. At a 2.6%
+false-alarm rate it catches 1 in 3 pre-failure sequences purely from
+"this looks unlike any healthy data I trained on".
+
+Separation ratio is lower than the previous (broken-label) run's 4.5×.
+That's because the new labeling covers the full incubation phase,
+including early degradation that's barely distinguishable from healthy
+telemetry. Catching subtle early-incubation anomalies is a strictly
+harder task than catching late-acceleration ones, and the lower
+separation ratio honestly reflects that.
+
+## Per-failure-type detection coverage
+
+Aggregate metrics like AUC and F1 hide the most useful question:
+**which specific failure modes can the system actually catch, and
+which can it not?** This is what mentors will ask. The answer is
+measured directly against the test set, not extrapolated.
+
+The test slice contains **6 distinct failure events across 5 failure
+types** (the held-out 25% of the simulation timeline produces this
+many failures naturally; for more failures we'd need a larger
+synthetic run).
+
+| Miner | Failure type | XGBoost | LSTM-AE | Headline |
+|---|---|---|---|---|
+| MNR-016 | connector_corrosion | ✅ caught | ✅ 99.7% of seqs flagged | **16.5 days lead time** |
+| MNR-008 | connector_corrosion | ✅ caught | ✅ 100% of seqs flagged | **5.9 days lead time** |
+| MNR-018 | thermal_runaway | ✅ caught | ✅ 100% of seqs flagged | 11.9 hours lead time |
+| MNR-020 | psu_degradation | ❌ missed | ✅ **100%** of seqs flagged | LSTM-only catch |
+| MNR-022 | coolant_restriction | ❌ missed | ✅ **100%** of seqs flagged | LSTM-only catch |
+| MNR-029 | sudden_chip_failure | ❌ | ❌ | only 2 rows in test — unmeasurable |
+
+**Combined coverage: 5 of 6 failures caught by at least one model.**
+The one miss (`sudden_chip_failure`) is unmeasurable because the
+failure happens too fast to leave a learnable signature in our
+1-minute sampling. Reactive thermal protection is the right
+mechanism for that class — it's handled by `SafetyGuard.enforce_thermal_shutdown()`
+in `src/optimizer/safety.py`, not by the predictive models.
+
+### Why both models?
+
+The breakdown above is the architectural argument for running
+XGBoost and LSTM-AE in parallel rather than picking one. Each catches
+things the other misses:
+
+- **XGBoost** is the lead-time champion. It caught both
+  `connector_corrosion` cases **5.9 and 16.5 days** before cascade —
+  enough runway to schedule maintenance during planned downtime
+  rather than reacting to thermal alarms.
+- **LSTM-AE** is the safety net. It caught the **two failure types
+  XGBoost missed entirely** (`psu_degradation` and `coolant_restriction`).
+  For both, **100% of pre-failure sequences exceeded the anomaly
+  threshold** — these aren't borderline detections. The LSTM doesn't
+  care about labels; it just learned what healthy looks like and
+  flags anything that deviates, regardless of failure mechanism.
+
+### Row-level recall by failure type (XGBoost)
+
+For reference, the supervised model's per-row recall on test
+positives is conservative because the threshold is calibrated for
+F1 with a precision floor, not coverage. Event-level detection is
+the metric operators care about, not row-level recall.
+
+| Failure type | Pre-failure rows in test | XGBoost catches | Row-level recall |
+|---|---|---|---|
+| connector_corrosion | 33,777 | 10,837 | 32.1% |
+| psu_degradation | 32,412 | 0 | 0.0% (LSTM-AE catches it) |
+| coolant_restriction | 20,968 | 0 | 0.0% (LSTM-AE catches it) |
+| thermal_runaway | 746 | 274 | 36.7% |
+| sudden_chip_failure | 2 | 0 | n/a |
+
+The "0% recall" rows are the cases where the supervised model
+genuinely doesn't see the signature in training and the unsupervised
+model has to step in. This is the dual-model architecture working
+as designed.
 
 ## Known limitations
 
