@@ -45,23 +45,39 @@ via two complementary modules:
 
 ### 2.1 Why two models, not one
 
-The system runs **XGBoost** (supervised failure classifier) and
-**LSTM-Autoencoder** (unsupervised anomaly detector) in parallel. This
-isn't architectural symmetry for its own sake — it's a response to a
-concrete limitation observed in the data.
+The system architecture runs **XGBoost** (supervised failure
+classifier) and **LSTM-Autoencoder** (unsupervised anomaly detector)
+in parallel. The intent was concrete: XGBoost learns patterns
+specific to the failure types it has seen during training, so an
+under-represented failure type becomes a blind spot at inference
+time. An autoencoder trained only on healthy telemetry is supposed
+to fill that gap by flagging anything that deviates from the healthy
+distribution, regardless of whether the deviation matches a known
+failure class.
 
-XGBoost is trained on labeled pre-failure rows and learns patterns
-specific to the failure types it has seen during training. If a
-failure type is under-represented in the training set, XGBoost will
-have a blind spot on it at inference time. LSTM-AE, by contrast, is
-trained only on healthy telemetry and flags anything that deviates
-from the healthy distribution — it catches novel failure signatures
-without ever being told what "failure" looks like.
+In practice, **only XGBoost is a working detector in this
+submission.** The LSTM-AE plumbing (training, threshold calibration,
+scaler persistence, live-inference hook, metadata sidecar, and
+determinism guardrails) is all in place, but the trained autoencoder
+has an inverted separation ratio on the held-out test set
+(sep = 0.54×, healthy mean error 0.338 vs failure mean error 0.184
+— failure sequences reconstruct *better* than healthy) because the
+healthy manifold across 26 miners of mixed hardware is too broad
+for a 64-hidden AE while failure sequences frequently contain
+trivially-reconstructable flat/constant patterns (shutdown, stuck
+values). Earlier drafts of this report quoted sep = 2.66× for the
+LSTM — that was a reporting artifact from an Apple Silicon MPS
+kernel bug where `batch_size=128` with this LSTM silently returned
+numerically wrong outputs. The fix forces CPU inference for
+reconstruction error; the weights themselves are fine; the model
+itself simply does not work on this dataset.
 
-Measured on our held-out test set (see §5), this is exactly what
-happens: XGBoost has 0% row-level recall on `psu_degradation` and
-`coolant_restriction`, while LSTM-AE flags 100% of pre-failure
-sequences for both. Neither model alone provides fleet coverage.
+The architectural argument for two models remains valid as forward
+guidance — making the autoencoder actually work would require
+per-miner-model scaling, a larger latent, or a contrastive
+objective — and the code paths needed for a second detector are
+already integrated. For this submission, XGBoost is the detector
+of record.
 
 ### 2.2 Why rule-based optimizer (not RL)
 
@@ -183,15 +199,24 @@ validation decision.
 | `scale_pos_weight` (sqrt-capped) | 4.5 (from raw 20.2) |
 | Decision threshold | 0.119 (tuned on validation only) |
 
-### 5.2 LSTM-Autoencoder
+### 5.2 LSTM-Autoencoder (non-functional on this dataset)
 
 | Metric | Value |
 |---|---|
-| Best validation loss | 0.00717 (epoch 7, early-stopped at 11) |
-| Anomaly threshold (95th percentile of healthy val errors) | 0.00753 |
-| **Healthy false-alarm rate** | **2.6%** |
-| **Failure sequence detection rate** | **33.4%** |
-| Separation ratio (mean failure / mean healthy error) | **2.66×** |
+| Best validation loss | 0.3654 (epoch 2, early-stopped at 6) |
+| Anomaly threshold (95th percentile of healthy val errors) | 1.0002 |
+| Healthy false-alarm rate | 3.1% |
+| Failure sequence detection rate | 0.2% |
+| Mean reconstruction error (healthy) | 0.3377 |
+| Mean reconstruction error (failure) | 0.1837 |
+| Separation ratio (mean failure / mean healthy error) | **0.54× (inverted)** |
+
+The autoencoder does not separate failure sequences from healthy
+ones on this dataset. See §2.1 for the reason (broad healthy
+manifold across mixed hardware + flat failure patterns), and the
+README's "LSTM-Autoencoder" section for a short postmortem on
+the MPS `batch_size=128` reporting bug that hid this for several
+iterations of the project.
 
 ### 5.3 Per-failure-type detection coverage
 
@@ -199,39 +224,50 @@ The headline operator-facing question is: **which specific failure
 modes can the system catch?** Measured directly against the 6
 distinct failure events in the held-out test set:
 
-| Miner | Failure type | XGBoost | LSTM-AE | Best lead time |
-|---|---|---|---|---|
-| MNR-016 | connector_corrosion | ✅ caught | ✅ 99.7% seq | **16.5 days** |
-| MNR-008 | connector_corrosion | ✅ caught | ✅ 100% seq | **5.9 days** |
-| MNR-018 | thermal_runaway | ✅ caught | ✅ 100% seq | 11.9 hours |
-| MNR-020 | psu_degradation | ❌ missed | ✅ **100%** seq | LSTM safety net |
-| MNR-022 | coolant_restriction | ❌ missed | ✅ **100%** seq | LSTM safety net |
-| MNR-029 | sudden_chip_failure | ❌ | ❌ | 2 rows — unmeasurable |
+| Miner | Failure type | XGBoost | Best lead time |
+|---|---|---|---|
+| MNR-016 | connector_corrosion | ✅ caught | **16.5 days** |
+| MNR-008 | connector_corrosion | ✅ caught | **5.9 days** |
+| MNR-018 | thermal_runaway | ✅ caught | 11.9 hours |
+| MNR-020 | psu_degradation | ❌ missed | — |
+| MNR-022 | coolant_restriction | ❌ missed | — |
+| MNR-029 | sudden_chip_failure | ❌ | 2 rows — unmeasurable |
 
-**Combined coverage: 5 of 6 measurable failure events caught by at
-least one model, with average XGBoost lead time of 7.6 days on its
-three catches.**
+**Coverage: 3 of 6 test failures caught by XGBoost, with an
+average lead time of 7.6 days on its three catches.** The
+strongest operational result is the 16.5-day lead time on the
+slow-developing `connector_corrosion` case on MNR-016 —
+comfortably within the window for a planned maintenance cycle.
 
-The one miss, `sudden_chip_failure`, is unmeasurable rather than
-unmodelable: the failure leaves only 2 pre-failure rows in the test
-set because it completes within minutes. Predictive detection is
-fundamentally unsuitable for that failure class;
-`SafetyGuard.enforce_thermal_shutdown()` handles it reactively.
+The LSTM-AE was intended to catch the `psu_degradation` and
+`coolant_restriction` cases that XGBoost misses (earlier drafts
+of this report claimed it did) but the real numbers show it does
+not (§5.2, §2.1). The `sudden_chip_failure` miss is unmeasurable
+rather than unmodelable: the failure leaves only 2 pre-failure
+rows in the test set because it completes within minutes.
+Predictive detection is fundamentally unsuitable for that failure
+class; `SafetyGuard.enforce_thermal_shutdown()` handles it
+reactively.
 
 ### 5.4 Row-level recall by failure type (XGBoost)
 
-| Failure type | Pre-failure rows | Caught | Row recall | LSTM alternative |
-|---|---|---|---|---|
-| `connector_corrosion` | 33,777 | 10,837 | 32.1% | 99.8% (sequences) |
-| `psu_degradation` | 32,412 | 0 | 0.0% | **100%** (sequences) |
-| `coolant_restriction` | 20,968 | 0 | 0.0% | **100%** (sequences) |
-| `thermal_runaway` | 746 | 274 | 36.7% | 100% (sequences) |
+| Failure type | Pre-failure rows | Caught | Row recall |
+|---|---|---|---|
+| `connector_corrosion` | 33,777 | 10,837 | 32.1% |
+| `psu_degradation` | 32,412 | 0 | 0.0% |
+| `coolant_restriction` | 20,968 | 0 | 0.0% |
+| `thermal_runaway` | 746 | 274 | 36.7% |
 
 The XGBoost blind spots on `psu_degradation` and `coolant_restriction`
-are not a modeling bug — they are the direct consequence of failure
-type imbalance in training. They are also the single strongest
-argument for the dual-model architecture. Without LSTM-AE, 2 of 5
-measurable failure types go undetected.
+are the direct consequence of failure-type imbalance in training.
+They were the principal motivation for the dual-model architecture
+— an unsupervised detector was supposed to fill this gap — and they
+remain unfilled in this submission. Closing these gaps would be the
+single highest-value followup: either by rebalancing the training
+set with more examples of these failure modes, by adding
+hand-designed features targeted at their signatures (PSU ripple,
+inlet/outlet delta-T), or by making the autoencoder actually work
+(§2.1).
 
 ### 5.5 Head-to-head against a simple threshold baseline
 
@@ -280,14 +316,13 @@ matters more than the small losses because 16 days of lead time is
 qualitatively different operational value — it covers a full planned
 maintenance cycle.
 
-**Overall picture when all three signals are combined:**
+**Overall picture:**
 
 | Detector | Failures caught | False-alarm rate | Operator takeaway |
 |---|---|---|---|
-| XGBoost alone | 3 / 6 | 3.4% | Clean signal, great lead times on its wins |
-| LSTM-AE alone | 5 / 6 | 2.6% (seq) | Catches what XGBoost misses |
+| **XGBoost** (this submission) | **3 / 6** | **3.4%** | Clean signal, great lead times on its wins |
 | Threshold rule alone | 5 / 6 | 21.2% | Noisy, reactive, floods inbox |
-| **XGBoost + LSTM-AE** | **5 / 6** | **< 4% combined** | **Quiet + complete** |
+| LSTM-AE alone | 0 / 6 | 3.1% | Non-functional on this dataset — see §5.2 |
 
 ### 5.6 Short-dataset degradation (validate.py findings)
 
@@ -344,15 +379,17 @@ designed around this asymmetry.
      is clamped to the per-miner spec's `[min, max]` range. The
      model cannot accidentally request values outside hardware
      tolerances.
-2. **Two-model redundancy.** Neither XGBoost nor LSTM-AE alone can
-   cover the fleet. If one model is compromised, poisoned, or drifts,
-   the other continues to flag obviously anomalous telemetry.
+2. **Two-model architecture is in place for future use.** The
+   LSTM-AE code path (training, thresholding, live-inference hook)
+   is wired up even though the current trained model is non-functional
+   (§5.2). If a working autoencoder or any other unsupervised
+   detector replaces it, the rest of the pipeline does not need to
+   change. For now, only XGBoost is an active detector.
 3. **Interpretable ML.** XGBoost feature importance is inspectable.
    The top features after training are all physically meaningful
    (long-window voltage/hashrate trends, `te_health`, `temp_delta_c`).
    An operator can always ask "why was this flagged?" and get an
-   answer. LSTM-AE reconstruction error is per-sample inspectable for
-   the same purpose.
+   answer.
 4. **Threshold calibration on held-out data.** Decision thresholds
    are never tuned on the test set, eliminating the data-leakage
    class of bugs that would produce optimistic metrics in a report.
@@ -383,16 +420,19 @@ the batch pipeline metrics above are the ground truth.
 
 This prototype demonstrates a working AI-driven mining controller with
 honest, held-out metrics on physics-plausible synthetic data. The
-headline operational result is **5 of 6 measurable test failures
-detected by at least one model, with supervised lead times averaging
-7.6 days** — enough runway to schedule maintenance during planned
-downtime rather than reacting to thermal alarms.
+headline operational result is **3 of 6 test failures detected by
+XGBoost, with average lead times of 7.6 days on its catches** —
+enough runway to schedule maintenance during planned downtime rather
+than reacting to thermal alarms. The strongest single result is the
+16.5-day lead on `connector_corrosion`.
 
-The dual-model architecture is justified by measurement: XGBoost
-delivers long lead times on the failure types it has seen in training
-data, and LSTM-AE catches everything XGBoost missed without ever
-being shown a labeled failure. The only uncatchable failure is
-`sudden_chip_failure`, which is handled reactively by `SafetyGuard`.
+The dual-model architecture is in place but currently single-signal:
+XGBoost does the detection work on its own, because the LSTM-AE
+trained on this dataset does not separate failure sequences from
+healthy ones (§2.1, §5.2). Closing that gap is the highest-value
+followup. The `sudden_chip_failure` class is handled reactively by
+`SafetyGuard` rather than by prediction, because it leaves no
+learnable pre-failure signature.
 
 ### 7.1 Immediate followup (documented in `docs/REMAINING_FIXES.md`)
 

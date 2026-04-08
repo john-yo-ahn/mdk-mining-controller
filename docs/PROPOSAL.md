@@ -70,16 +70,22 @@ see `docs/REMAINING_FIXES.md`.
   planned for fix before demo.
 - F12: multi-class XGBoost targeting specific failure types (would
   close the `psu_degradation` and `coolant_restriction` blind spots
-  currently covered only by LSTM-AE).
+  which remain uncovered — the LSTM-AE was intended as the fallback
+  but does not work on this dataset; see TECHNICAL_REPORT §5.2).
 - F14: real MDK API client — gated on a data sharing channel with
   Tether mining ops.
 
 **Headline results** (30 × 120 held-out test, see TECHNICAL_REPORT §5):
 - XGBoost AUC = 0.801, avg lead time 7.6 days when it catches
-- LSTM-AE separation ratio 2.66×, 2.6% healthy false-alarm rate
-- Combined: **5 of 6 measurable test failures caught** by at least
-  one model, 6× lower false-alarm rate than a simple temperature +
-  hashrate threshold baseline
+- **3 of 6 test failures caught** by XGBoost, with the strongest
+  single result a 16.5-day lead time on `connector_corrosion`
+- 6× lower false-alarm rate than a simple temperature + hashrate
+  threshold baseline
+- LSTM-AE code path complete but trained model non-functional on
+  this dataset (separation ratio inverted at 0.54×); XGBoost is the
+  sole working detector in this submission. Earlier drafts claimed
+  5/6 coverage with LSTM catching the two XGBoost misses — that was
+  a phantom from an Apple Silicon MPS kernel bug, now fixed.
 
 ---
 

@@ -106,7 +106,10 @@ are:
 
 - **F1**: CLI live inference fix (2-3 h) — biggest visible bug
 - **F12**: multi-class XGBoost — closes the `psu_degradation` and
-  `coolant_restriction` blind spots currently covered only by LSTM
+  `coolant_restriction` blind spots which are currently uncovered
+  (LSTM-AE was intended as the fallback detector but does not work
+  on this dataset; see README / TECHNICAL_REPORT §5.2 for the
+  postmortem)
 - **F14**: real MDK API integration — gated on external dependency
 
 ## Reproducibility

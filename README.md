@@ -24,13 +24,15 @@ to swap in real telemetry once a data sharing channel exists.
    at multiple timescales, rate-of-change features, trend slopes,
    variance growth, cross-signal correlations, autocorrelation, peak
    counts, diurnal amplitude, and cross-miner container features.
-4. **Trains** two complementary models:
+4. **Trains** two models:
    - **XGBoost** classifier for supervised failure prediction
      (`is_pre_failure` ↔ degradation phase). Lead time ≈ 7 days
-     average for detected failures.
-   - **LSTM-Autoencoder** for unsupervised anomaly detection on
-     healthy-only data. Catches deviations even for failure types
-     the supervised model never saw.
+     average for detected failures. This is the working detector.
+   - **LSTM-Autoencoder** on healthy-only data as an unsupervised
+     safety-net. Currently non-functional on this dataset (see
+     Known limitations) — the training/inference plumbing and
+     determinism guardrails are all in place, but the model itself
+     doesn't separate failure from healthy sequences.
 5. **Predicts** in a live simulation: a Textual terminal dashboard
    runs a 30-miner fleet, injects failure scenarios on demand, and
    shows alerts, optimizer actions, and per-miner risk levels in
@@ -122,7 +124,7 @@ src/
 | Decision | Choice | Why |
 |---|---|---|
 | Primary failure prediction | XGBoost (`tree_method="hist"`) | Tabular data, interpretable, 30× faster than `exact` |
-| Anomaly detection | LSTM-Autoencoder (MPS-accelerated) | No failure labels needed, generalizes to unseen types |
+| Anomaly detection | LSTM-Autoencoder (CPU inference, MPS training) | No failure labels needed; intended as safety-net detector (currently non-functional — see Known limitations) |
 | Optimizer strategy | Rule-based with `SafetyGuard` | Auditable, conservative, safe for hardware |
 | Synthetic data | Physics-first generator | Thermodynamically grounded, controllable failure injection |
 | Storage | Two DuckDB files (batch + live) | Single-writer lock isolation, no contention |
@@ -156,26 +158,42 @@ reacting to thermal alarms.
 | Metric | Value |
 |---|---|
 | Training sequences | 649,133 (healthy only) |
-| Best val_loss | 0.007172 (epoch 7, early-stopped epoch 11) |
-| Threshold (95th pct of healthy val errors) | 0.007532 |
-| **Healthy false-alarm rate** | **2.6%** (5,214 / 200,357) |
-| **Failure detection rate** | **33.4%** (12,290 / 36,774) |
-| Mean reconstruction error (healthy) | 0.005734 |
-| Mean reconstruction error (failure) | 0.015254 |
-| **Separation ratio** | **2.66×** |
+| Best val_loss | 0.3654 (epoch 2, early-stopped epoch 6) |
+| Threshold (95th pct of healthy val errors) | 1.0002 |
+| Healthy false-alarm rate | 3.1% |
+| Failure detection rate | 0.2% |
+| Mean reconstruction error (healthy) | 0.3377 |
+| Mean reconstruction error (failure) | 0.1837 |
+| **Separation ratio** | **0.54×** (inverted — does not work) |
 
-The LSTM-AE is the safety-net detector — trained on healthy-only
-sequences, it doesn't need any failure labels and so generalizes to
-failure types the supervised model has never seen. At a 2.6%
-false-alarm rate it catches 1 in 3 pre-failure sequences purely from
-"this looks unlike any healthy data I trained on".
+**The LSTM-Autoencoder, as trained here, does not work on this
+dataset.** Failure sequences reconstruct *better* than healthy
+ones (sep < 1), because the healthy manifold is extremely broad
+(3.2 M training rows across 26 miners of different hardware models)
+while many failure sequences contain "flat/constant" patterns
+(shutdown, stuck values) that a small autoencoder reconstructs
+trivially well. XGBoost carries the predictive-maintenance
+capability on its own.
 
-Separation ratio is lower than the previous (broken-label) run's 4.5×.
-That's because the new labeling covers the full incubation phase,
-including early degradation that's barely distinguishable from healthy
-telemetry. Catching subtle early-incubation anomalies is a strictly
-harder task than catching late-acceleration ones, and the lower
-separation ratio honestly reflects that.
+Previous iterations of this README reported sep=2.66× and a 33%
+detection rate for the LSTM. Those numbers were a reporting
+artifact from an Apple Silicon MPS kernel bug where `batch_size=128`
+with this specific LSTM architecture returns numerically wrong
+outputs silently. The training script monitored val/test separation
+via that buggy path and saw phantom metrics, while reload via
+any other batch size or on CPU gave the real (poor) numbers.
+The fix in `src/models/lstm_autoencoder.py:compute_reconstruction_error`
+forces CPU inference regardless of training device, eliminating
+the bug. See commit history and `scripts/consistency_check.py`
+check 9 for the determinism test that keeps this from regressing.
+
+Concrete followups to make the LSTM actually work would include
+per-miner-model scaling (separate feature statistics by hardware
+type), a larger latent dimension, or replacing the reconstruction
+objective with a contrastive one. None of these are in scope for
+this 3-week prototype; the LSTM remains in the codebase as the
+unsupervised-branch hook for future work, but it is explicitly
+**not** a working component of this submission.
 
 ## Per-failure-type detection coverage
 
@@ -189,38 +207,33 @@ types** (the held-out 25% of the simulation timeline produces this
 many failures naturally; for more failures we'd need a larger
 synthetic run).
 
-| Miner | Failure type | XGBoost | LSTM-AE | Headline |
-|---|---|---|---|---|
-| MNR-016 | connector_corrosion | ✅ caught | ✅ 99.7% of seqs flagged | **16.5 days lead time** |
-| MNR-008 | connector_corrosion | ✅ caught | ✅ 100% of seqs flagged | **5.9 days lead time** |
-| MNR-018 | thermal_runaway | ✅ caught | ✅ 100% of seqs flagged | 11.9 hours lead time |
-| MNR-020 | psu_degradation | ❌ missed | ✅ **100%** of seqs flagged | LSTM-only catch |
-| MNR-022 | coolant_restriction | ❌ missed | ✅ **100%** of seqs flagged | LSTM-only catch |
-| MNR-029 | sudden_chip_failure | ❌ | ❌ | only 2 rows in test — unmeasurable |
+| Miner | Failure type | XGBoost | Headline |
+|---|---|---|---|
+| MNR-016 | connector_corrosion | ✅ caught | **16.5 days lead time** |
+| MNR-008 | connector_corrosion | ✅ caught | **5.9 days lead time** |
+| MNR-018 | thermal_runaway | ✅ caught | 11.9 hours lead time |
+| MNR-020 | psu_degradation | ❌ missed | — |
+| MNR-022 | coolant_restriction | ❌ missed | — |
+| MNR-029 | sudden_chip_failure | ❌ missed | only 2 rows in test — unmeasurable |
 
-**Combined coverage: 5 of 6 failures caught by at least one model.**
-The one miss (`sudden_chip_failure`) is unmeasurable because the
-failure happens too fast to leave a learnable signature in our
-1-minute sampling. Reactive thermal protection is the right
-mechanism for that class — it's handled by `SafetyGuard.enforce_thermal_shutdown()`
-in `src/optimizer/safety.py`, not by the predictive models.
+**Coverage: 3 of 6 failures caught by XGBoost.** The best catches
+are the two slow-developing `connector_corrosion` events with 5.9
+and 16.5 day lead times — enough runway to schedule maintenance
+during planned downtime rather than reacting to thermal alarms.
+The `thermal_runaway` case is caught with only 11.9 hours of lead
+time, which is still operationally useful compared to reactive
+thermal shutdown.
 
-### Why both models?
-
-The breakdown above is the architectural argument for running
-XGBoost and LSTM-AE in parallel rather than picking one. Each catches
-things the other misses:
-
-- **XGBoost** is the lead-time champion. It caught both
-  `connector_corrosion` cases **5.9 and 16.5 days** before cascade —
-  enough runway to schedule maintenance during planned downtime
-  rather than reacting to thermal alarms.
-- **LSTM-AE** is the safety net. It caught the **two failure types
-  XGBoost missed entirely** (`psu_degradation` and `coolant_restriction`).
-  For both, **100% of pre-failure sequences exceeded the anomaly
-  threshold** — these aren't borderline detections. The LSTM doesn't
-  care about labels; it just learned what healthy looks like and
-  flags anything that deviates, regardless of failure mechanism.
+The three misses are `psu_degradation`, `coolant_restriction`, and
+`sudden_chip_failure`. An earlier iteration of this README claimed
+the LSTM-AE caught the first two at 100% — those were phantom
+metrics from the MPS `batch_size=128` bug described below. The
+LSTM-AE does not actually catch them; its real separation ratio
+is inverted (sep=0.54×). `sudden_chip_failure` only leaves 2 rows
+in the test window, below anything a statistical model could
+learn from; `SafetyGuard.enforce_thermal_shutdown()` in
+`src/optimizer/safety.py` is the right mechanism for that class,
+not the predictive models.
 
 ### Row-level recall by failure type (XGBoost)
 
@@ -232,22 +245,37 @@ the metric operators care about, not row-level recall.
 | Failure type | Pre-failure rows in test | XGBoost catches | Row-level recall |
 |---|---|---|---|
 | connector_corrosion | 33,777 | 10,837 | 32.1% |
-| psu_degradation | 32,412 | 0 | 0.0% (LSTM-AE catches it) |
-| coolant_restriction | 20,968 | 0 | 0.0% (LSTM-AE catches it) |
+| psu_degradation | 32,412 | 0 | 0.0% |
+| coolant_restriction | 20,968 | 0 | 0.0% |
 | thermal_runaway | 746 | 274 | 36.7% |
 | sudden_chip_failure | 2 | 0 | n/a |
 
-The "0% recall" rows are the cases where the supervised model
-genuinely doesn't see the signature in training and the unsupervised
-model has to step in. This is the dual-model architecture working
-as designed.
+The two 0% rows are failure modes where the pre-failure telemetry
+signature is too close to healthy operation for the supervised
+model to learn a decision boundary under the current feature set
+and class imbalance. The LSTM-AE was supposed to be the fallback
+detector for these cases; see the LSTM section above for why it
+currently does not fill that role.
 
 ## Known limitations
 
 These are documented honestly so a reviewer doesn't have to discover
 them mid-demo.
 
-1. **Live CLI inference is approximate.** The
+1. **LSTM-Autoencoder does not detect anomalies on this dataset.**
+   The trained model has an inverted separation ratio (sep=0.54×,
+   meaning failure sequences reconstruct *better* than healthy)
+   because the healthy manifold across 26 miners of mixed hardware
+   is too broad for a 64-hidden AE while failure sequences often
+   contain easy-to-reconstruct flat patterns. Previous runs reported
+   sep=2.66× — that was a phantom metric from an Apple Silicon MPS
+   `batch_size=128` kernel bug that silently produced wrong outputs.
+   The bug is fixed (`compute_reconstruction_error` now forces CPU
+   inference), the model weights are correctly saved, and the real
+   numbers are what you see in the LSTM table above. Making the LSTM
+   actually work would need per-miner-model scalers, a larger latent,
+   or a contrastive objective — out of scope for this prototype.
+2. **Live CLI inference is approximate.** The
    `MinerBuffer.compute_features()` path in `src/cli/ai_bridge.py`
    computes ~80 features but the trained XGBoost model expects 152.
    Missing features are filled with zeros at inference time. The LSTM

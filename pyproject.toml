@@ -28,6 +28,11 @@ notebooks = ["jupyter>=1.0", "ipykernel>=6.0"]
 [tool.setuptools.packages.find]
 where = ["."]
 
+[dependency-groups]
+dev = [
+    "python-docx>=1.2.0",
+]
+
 [project.scripts]
 mdk = "src.cli.__main__:main"
 

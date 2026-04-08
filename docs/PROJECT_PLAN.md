@@ -73,14 +73,21 @@ Tasks:
     `scale_pos_weight`, F1-with-floor threshold strategy
   - **AUC 0.801, 3/6 test failures, avg 7.6-day lead time**
   - Full feature importance analysis in `notebooks/02_results.ipynb`
-- [x] LSTM-Autoencoder anomaly detection
+- [x] LSTM-Autoencoder anomaly detection (plumbing complete, model
+      non-functional on this dataset — see README "LSTM-Autoencoder"
+      section and TECHNICAL_REPORT §5.2 for the postmortem)
   - Trained on healthy-only sequences (649k sequences × 60 min)
   - Persistent global scaler serialized with model weights
   - Early stopping + best-weight restore
-  - MPS (Apple Silicon GPU) training, 2120s wall clock
-  - **Separation ratio 2.66×, 2.6% healthy FAR, 33.4% seq detection**
-  - **Catches 5/5 failures with measurable sequences** — including
-    the two failure types XGBoost has blind spots on
+  - MPS training with CPU inference (CPU inference is the fix for a
+    silent MPS `batch_size=128` kernel bug that previously produced
+    phantom positive separation metrics)
+  - **Real separation ratio 0.54× (inverted)** — failure sequences
+    reconstruct better than healthy because the healthy manifold
+    across mixed hardware is too broad for a 64-hidden AE while
+    failure sequences often contain flat/constant patterns
+  - XGBoost is the sole working detector in this submission;
+    making the LSTM actually work is a followup
 - [x] Rule-based efficiency optimizer (stretch)
   - `src/optimizer/rules.py` — thermal, energy price, degradation rules
   - `src/optimizer/safety.py` — SafetyGuard with thermal shutdown
