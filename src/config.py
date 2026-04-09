@@ -298,10 +298,43 @@ class FeatureConfig:
 
 @dataclass
 class TEConfig:
+    # Cooling + infrastructure overhead on the denominator.
+    # "How much site power is consumed per watt of chip power" —
+    # cooling = alpha_cooling (fans + CRACs), infra = beta_infra
+    # (PDUs, network, lighting). Combined 1 + alpha + beta = 1.20 by
+    # default, i.e. facility draws 1.20 W per 1 W of chip work.
     alpha_cooling: float = 0.15
     beta_infra: float = 0.05
+
+    # Environmental penalty on te_adjusted:
+    #     te_adjusted = te_base × (1 - delta_temp × max(0, ambient - temp_baseline_c))
+    # A miner in a 35°C environment gets a (1 - 0.008 × 10) = 0.92 ×
+    # haircut versus the same hardware in a 25°C environment.
     delta_temp: float = 0.008
     temp_baseline_c: float = 25.0
+
+    # Chip voltage stability penalty (Assignment §3.1.b variable #2).
+    # Miners operating at their spec's default voltage get 1.0; each
+    # percent deviation from default costs voltage_penalty_coefficient
+    # percentage points off the factor. 0.5 was chosen so that:
+    #   * the measured ±2% healthy voltage noise maps to ~1% penalty
+    #     (negligible on healthy rows; adds no separation noise)
+    #   * a 20% deviation (~a failing chip at 0.30 V vs 0.38 V spec)
+    #     maps to a 10% penalty (meaningful, not dominant)
+    # The clip [0, 1] below in compute_te_base guards against extreme
+    # voltages producing negative factors.
+    voltage_penalty_coefficient: float = 0.5
+
+    # Device operating mode weights (Assignment §3.1.b variable #4).
+    # Idle and Shutdown miners contribute zero true efficiency because
+    # they are not producing useful work, regardless of how little
+    # power they are drawing. Normal is 1.0. Unknown/novel modes
+    # default to 1.0 in compute_te_base.
+    operating_mode_weights: Dict[str, float] = field(default_factory=lambda: {
+        "Normal": 1.0,
+        "Idle": 0.0,
+        "Shutdown": 0.0,
+    })
 
 
 # ── Optimizer Config ──────────────────────────────────────────────────
