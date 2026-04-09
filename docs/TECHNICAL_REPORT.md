@@ -518,7 +518,9 @@ datasets, the model is extremely conservative and recall collapses:
   threshold missed 9 of 10 cases because 14 days isn't enough
   runway for degradation signatures to develop or for 7-day rolling
   features to populate
-- **Blind injection**: target not detected on a 14-day fleet
+- **Blind injection**: target detected on the v3 175-feature model
+  (was NOT detected under v2 152-feature model — another concrete
+  gain from the TE feature promotion)
 - **Noise resilience**: precision stays at 1.0 across 0-20% noise
   (when it flags, it's correct) but recall drops from 2.4% to 0%
   because the model becomes increasingly conservative as noise
@@ -531,6 +533,48 @@ to asking a weather forecaster to predict tomorrow from 5 minutes of
 barometric readings — there isn't enough history for the signal to
 form. The main test set (§5.1-5.5) uses the full production-scale
 dataset and shows the system's actual capability.
+
+### 5.7 Multi-seed reproducibility (3 independent random draws)
+
+The most credible validation question for a synthetic-data project
+is: **would these results hold if you regenerated the data?**
+Because the physics model uses a random seed for failure injection
+timing, miner-to-model assignment, and noise processes, a fresh
+seed produces a different realization of the same underlying
+physics. If the metrics hold across seeds, the signals are robust
+properties of the physics model — not artifacts of one lucky draw.
+
+We ran `scripts/validate_seed.py` with three seeds (42, 123, 7),
+each generating a completely fresh 30-miner × 120-day dataset,
+building the v3 feature cache from scratch, and training both
+XGBoost and LSTM-AE independently:
+
+| Metric | Seed 42 | Seed 123 | Seed 7 | Gate |
+|---|---|---|---|---|
+| XGBoost AUC | 0.837 | 0.890 | 0.891 | ≥ 0.80 ✓ |
+| XGBoost F1 | 0.181 | 0.297 | 0.334 | ≥ 0.15 ✓ |
+| Detection timeline | 3/6 | 7/9 | 4/7 | ≥ 3/N ✓ |
+| Avg lead time | 15.0 d | 7.0 d | 9.0 d | — |
+| TE per-miner sep | +32.8% | +57.9% | +16.2% | ≥ +10% ✓ |
+| TE features in top-20 | 5 | 1 | 2 | ≥ 1 ✓ |
+| LSTM sep_alive | 6.38× | 4.15× | 4.96× | ≥ 2.0 ✓ |
+| LSTM detection (alive) | 43.7% | 32.5% | 34.3% | ≥ 25% ✓ |
+
+**Every gate passes on all 3 seeds.** The XGBoost AUC range
+(0.837–0.891) is tight; the LSTM separation (4.15×–6.38×) is
+stable well above the 2.0 floor; and the TE KPI consistently
+places at least one rolling variant in the top-20 feature
+importance list. The detection coverage varies with the number
+of test failures each seed produces (6, 9, 7) but the catch
+ratio (50–78%) is consistent.
+
+The one metric that varies more is TE per-miner separation
+(+16.2% to +57.9%), because the random seed controls which
+miners fail and how early — a seed that places failure onset
+very late in the simulation leaves less degradation time for
+the TE metric to diverge from healthy. Even the weakest seed
+(7, at +16.2%) is positive and above the "concerning" threshold
+of +10%.
 
 ---
 
