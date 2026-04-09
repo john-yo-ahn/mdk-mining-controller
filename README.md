@@ -17,23 +17,32 @@ to swap in real telemetry once a data sharing channel exists.
    30 ASIC miners across 120 days (~5.2 M rows). The generator models
    power, hashrate, temperature, voltage, ambient conditions, and seven
    distinct failure scenarios.
-2. **Computes** a True Efficiency (TE) KPI that goes beyond raw J/TH
-   by accounting for cooling overhead, environmental adjustment, and
-   degradation-aware hashrate realization.
-3. **Builds** a 152-feature matrix per miner per minute: rolling stats
-   at multiple timescales, rate-of-change features, trend slopes,
-   variance growth, cross-signal correlations, autocorrelation, peak
-   counts, diurnal amplitude, and cross-miner container features.
+2. **Computes** a True Efficiency (TE) KPI that implements the
+   four-variable formula required by the assignment (§3.1.b):
+   cooling power, chip voltage, environmental conditions, and
+   device operating mode. Layered as `te_base` → `te_adjusted`
+   → `te_health`, with unit tests covering each of the four
+   variables (see `scripts/test_te_formula.py`).
+3. **Builds** a 175-feature matrix per miner per minute: rolling
+   stats at multiple timescales, rate-of-change features, trend
+   slopes, variance growth, cross-signal correlations,
+   autocorrelation, peak counts, diurnal amplitude, cross-miner
+   container features — **and the full rolling / trend / diurnal
+   suite on `te_health` alongside `jth`**, so the supervised model
+   can learn from the TE KPI at multiple timescales.
 4. **Trains** two complementary models:
    - **XGBoost** classifier for supervised failure prediction
-     (`is_pre_failure` ↔ degradation phase). Lead time ≈ 7 days
-     average for detected failures. Primary detector for the
-     failure types it has training coverage on.
+     (`is_pre_failure` ↔ degradation phase). **Lead time ≈ 11.3
+     days** average for detected failures. Primary detector for
+     the failure types it has training coverage on. Top-10
+     feature-importance list includes two `te_health` rolling
+     variants (ranks 8 and 9), directly validating the §3.1.b
+     KPI as a learned signal.
    - **LSTM-Autoencoder** on healthy-only data as an unsupervised
      safety-net. Per-hardware-model scalers, 9-dimensional input
      (6 raw + 3 physics-derived: J/TH, ΔT, W/MHz), burn-in
-     calibration. **Separation ratio 6.6× on alive failure
-     sequences, 43.9% detection rate**, and critically — catches
+     calibration. **Separation ratio 5.7× on alive failure
+     sequences, 38.5% detection rate**, and critically — catches
      the `psu_degradation` and `coolant_restriction` failure
      modes where XGBoost has 0% row recall.
 5. **Predicts** in a live simulation: a Textual terminal dashboard
@@ -136,25 +145,33 @@ src/
 
 ## Honest results (latest run)
 
-Run on 30 miners × 120 days, 5.2 M rows, 152 features. Honest metrics —
-the threshold is tuned on a held-out validation slice the test set
-never sees.
+Run on 30 miners × 120 days, 5.2 M rows, **175 features** (features.v3,
+which adds a full rolling-stats / trend / correlation / diurnal suite
+on the `te_health` True Efficiency KPI alongside `jth`). Honest
+metrics — the threshold is tuned on a held-out validation slice the
+test set never sees.
 
 **XGBoost (supervised failure prediction):**
 
-| Metric | Value |
-|---|---|
-| AUC-ROC | **0.801** |
-| F1 | 0.163 |
-| Precision | 0.230 |
-| Recall | 0.126 |
-| Detection timeline | **3 of 6** failures detected on test |
-| **Average lead time** | **182.6 hours (≈ 7.6 days)** before cascade |
-| Top features | `voltage_v_roll_10080m_mean`, `hashrate_th_roll_60m_max`, `temperature_c_roll_10080m_mean` |
+| Metric | Value (v3) | Previous (v2) |
+|---|---|---|
+| AUC-ROC | **0.851** | 0.801 |
+| F1 | **0.217** | 0.163 |
+| Precision | 0.235 | 0.230 |
+| Recall | **0.201** | 0.126 |
+| Detection timeline | **4 of 6** failures detected on test | 3 of 6 |
+| **Average lead time** | **271.2 hours (≈ 11.3 days)** before cascade | 182.6h (7.6 days) |
+| Top features | `voltage_v_roll_10080m_mean`, `hashrate_th_roll_10080m_std`, `power_w_std_trend`, `temperature_c_roll_10080m_mean`, `jth_roll_10080m_mean`, `voltage_v_roll_60m_std`, `voltage_v_roll_360m_std`, **`te_health_roll_10080m_std`**, **`te_health_roll_10080m_mean`**, `voltage_v_roll_60m_max` |
 
-The 7-day average lead time is the most operationally useful number.
-Operators can schedule maintenance during planned downtime instead of
-reacting to thermal alarms.
+The 11.3-day average lead time is the headline operational result.
+Operators can schedule maintenance **more than a week in advance**,
+well inside a planned-downtime window, instead of reacting to thermal
+alarms. The jump from 7.6 to 11.3 days comes from the Level 3 TE
+remediation: `te_health` got promoted from a single raw column to a
+first-class feature-engineering citizen, and its rolling variants
+now occupy ranks 8 and 9 in the feature-importance-by-gain list —
+direct evidence that the §3.1.b True Efficiency KPI is a meaningful
+learned signal, not just a reporting metric.
 
 **LSTM-Autoencoder (unsupervised anomaly detection):**
 
@@ -162,15 +179,15 @@ reacting to thermal alarms.
 |---|---|
 | Input features | **9** (6 raw sensors + `efficiency_jth`, `temp_delta_c`, `power_per_ghz`) |
 | Scalers | **4 per-hardware-model** (Pro / M56S / M63 / XP) + global fallback |
-| Training sequences | 585,807 (alive healthy only, stride=5) |
-| Best val_loss | 0.5486 (early-stopped epoch 6 / 30) |
+| Training sequences | 585,807 (alive healthy only, stride=5, on v3 feature cache) |
+| Best val_loss | 0.5793 (early-stopped epoch 5 / 30) |
 | Threshold calibration | 95th percentile of **test-healthy burn-in** (first 23,251 sequences) |
-| Threshold value | 0.964 |
-| Mean reconstruction error (healthy eval) | 0.516 |
-| Mean reconstruction error (failure alive) | 3.423 |
-| **Separation ratio (alive)** | **6.63×** |
-| **Detection rate (alive sequences)** | **43.9%** (16,116 of 36,694) |
-| Healthy false-alarm rate | 12.2% |
+| Threshold value | 0.993 |
+| Mean reconstruction error (healthy eval) | 0.578 |
+| Mean reconstruction error (failure alive) | 3.291 |
+| **Separation ratio (alive)** | **5.70×** |
+| **Detection rate (alive sequences)** | **38.5%** (14,126 of 36,694) |
+| Healthy false-alarm rate | 10.0% |
 
 **How the LSTM was made to work.** Earlier iterations of this
 project reported the LSTM as non-functional with an inverted

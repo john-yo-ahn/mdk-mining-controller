@@ -42,9 +42,17 @@ Tasks:
   - Label-fix verification asserted inline
 - [x] Design and implement True Efficiency (TE) KPI
   - `src/kpi/true_efficiency.py` — base, adjusted, health variants
-  - **Validated**: `te_health` separates healthy/failing by 114.4%
-    vs ~14% for naive J/TH
-  - `te_health` is one of the top-10 features XGBoost actually uses
+  - **Assignment-compliant formula** incorporating all four §3.1.b
+    required variables: cooling power, chip voltage,
+    environmental conditions, device operating mode
+  - Unit-tested in `scripts/test_te_formula.py` (10 tests, all pass)
+  - Per-miner separation healthy vs failing: **+32.8%** on
+    `te_health`, **+31.9%** on `te_base` (both layers now
+    meaningful discriminators, not just the top layer via
+    hashrate_realization)
+  - `te_health_roll_10080m_std` and `te_health_roll_10080m_mean`
+    rank **8 and 9** in XGBoost feature-importance-by-gain
+    (v3 175-feature matrix)
 - [x] Create initial visualizations
   - Time-series per-device traces (EDA notebook section 4)
   - Per-miner phase timelines (EDA notebook section 7)
@@ -58,11 +66,13 @@ Tasks:
 
 Tasks:
 - [x] Feature engineering for predictive maintenance
-  - **152 features** at 6 rolling window scales (2m/15m/1h/6h/1d/7d)
+  - **175 features** at 6 rolling window scales (2m/15m/1h/6h/1d/7d)
   - Rate of change, trend slopes (7-day OLS), variance trends
   - Cross-signal correlations, autocorrelation, peak counts
   - Diurnal amplitude, cross-miner container features
-  - Cached to `data/processed/features.v2.parquet` with explicit
+  - Full rolling/trend/correlation/diurnal suite on **`te_health`**
+    alongside `jth` (Level 3 TE remediation)
+  - Cached to `data/processed/features.v3.parquet` with explicit
     `FEATURES_VERSION` constant for invalidation
 - [x] XGBoost failure prediction model
   - Binary classification, `is_pre_failure` derived from
@@ -71,7 +81,8 @@ Tasks:
     of cumulative positives)
   - `tree_method='hist'` (30× faster than exact), sqrt-capped
     `scale_pos_weight`, F1-with-floor threshold strategy
-  - **AUC 0.801, 3/6 test failures, avg 7.6-day lead time**
+  - **AUC 0.851, 4/6 test failures, avg 11.3-day lead time**
+    (v3 cache; v2 baseline was 0.801 / 3-of-6 / 7.6d)
   - Full feature importance analysis in `notebooks/02_results.ipynb`
 - [x] LSTM-Autoencoder anomaly detection (working after Phases
       0/A/B/C/D — see README "LSTM-Autoencoder" section and

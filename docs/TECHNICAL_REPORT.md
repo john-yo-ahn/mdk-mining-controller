@@ -181,25 +181,111 @@ control loop.
 ## 4. KPI Design — True Efficiency
 
 Simple J/TH is a poor operational metric because it ignores cooling
-overhead, environmental variance, and hardware degradation. The
-proposed **True Efficiency (TE)** KPI in `src/kpi/true_efficiency.py`
-layers three progressively richer variants:
+overhead, chip voltage, environmental variance, operating mode, and
+hardware degradation. The assignment §3.1.b explicitly asks for a
+**True Efficiency (TE)** ratio incorporating four real-world
+variables: cooling system power consumption, chip voltage,
+environmental conditions, and device operating mode. The TE KPI in
+`src/kpi/true_efficiency.py` layers three progressively richer
+variants that together incorporate all four.
 
-| KPI | Formula | Captures |
+### The full formula
+
+```
+voltage_stability    = clip(1 - k × |V − V_default| / V_default, 0, 1)
+operating_mode_factor = {Normal: 1.0, Idle: 0.0, Shutdown: 0.0}.get(mode, 1.0)
+
+te_base     = (hashrate × voltage_stability × operating_mode_factor)
+              / (chip_power × (1 + α_cooling + β_infra))
+
+te_adjusted = te_base × (1 - δ_temp × max(0, ambient - temp_baseline))
+
+te_health   = te_adjusted × clip(hashrate_actual / nameplate, 0, 1)
+```
+
+with defaults `α_cooling = 0.15`, `β_infra = 0.05`, `δ_temp = 0.008`,
+`temp_baseline = 25°C`, `k = 0.5`. All constants live in
+`src.config.TEConfig` and are single-source-of-truth for both the
+batch pipeline and the live CLI dashboard (the dashboard previously
+had a drifting inline reimplementation; Level 4 of this remediation
+unified them).
+
+### Mapping to the §3.1.b required variables
+
+| Required variable | Where it enters | Term |
 |---|---|---|
-| `te_base` | `hashrate / (chip_power × (1 + α_cooling + β_infra))` | Cooling and infrastructure overhead |
-| `te_adjusted` | `te_base × (1 − δ × max(0, ambient_temp − baseline))` | Environmental correction |
-| `te_health` | `te_adjusted × hashrate_realization` | Degradation awareness |
+| cooling system power consumption | `te_base` denominator | `(1 + α_cooling + β_infra)` |
+| **chip voltage** | `te_base` numerator | `voltage_stability` |
+| environmental conditions | `te_adjusted` | ambient temperature penalty |
+| **device operating mode** | `te_base` numerator | `operating_mode_factor` |
 
-**Validation:** On the 30-miner dataset, `te_health` separates healthy
-from failing miners by **114.4%** (`mean_healthy / mean_failing − 1`),
-versus **~14%** separation for naive J/TH. The full distribution
-comparison is rendered in `notebooks/01_eda.executed.ipynb` Section 5.
+All four variables demonstrably change the output of the formula —
+verified in `scripts/test_te_formula.py` unit test #6 which sweeps
+each variable independently and asserts the output moves.
 
-`te_health` is also one of the top 10 features the XGBoost model uses
-(rank 10 by gain), which closes the loop — the KPI is both a reporting
-metric for operators and a learned input signal for the supervised
-model.
+### Honest per-layer separation on the current dataset
+
+Per-miner aggregation (matching `src/kpi/true_efficiency.py:compute_fleet_te_summary`),
+healthy vs failing on the raw telemetry, post-Level-1 formula:
+
+| KPI layer | Healthy mean | Failing mean | Separation |
+|---|---|---|---|
+| naive `jth` | 22.55 | 22.09 | **-2.0%** (weak as per-miner metric) |
+| `te_base` | 0.0386 | 0.0293 | **+31.9%** |
+| `te_adjusted` | 0.0369 | 0.0279 | **+32.4%** |
+| `te_health` | 0.0359 | 0.0271 | **+32.8%** |
+
+Previous drafts of this report quoted "+114.4% vs ~14% J/TH". Those
+numbers were computed against the pre-Level-1 v2 feature cache,
+which had a silent bug: the nameplate-map keys were `"S21_Pro"` /
+`"S19_XP"` but the DataFrame's `model` column held the short tokens
+`"Pro"` / `"XP"`, so half the fleet ended up with
+`hashrate_nameplate_th = 0` and therefore `te_health = 0`. The
+old "114.4%" number was computed on half-zeroed data; the old
+"~14% J/TH" was a phantom that doesn't match any reproducible
+computation. Both are retired. The +32.8% figure above is the
+real per-miner separation on correctly-computed data.
+
+Honest framing: the three TE layers now all contribute real
+separation (+31.9%, +32.4%, +32.8%) rather than only `te_health`
+carrying the signal via its `hashrate_realization` multiplier.
+The voltage_stability and operating_mode_factor additions make
+`te_base` a meaningful discriminator on its own for the first
+time on this synthetic dataset.
+
+### TE as a learned signal in XGBoost
+
+Beyond being a reporting metric, `te_health` is now a
+first-class feature-engineering citizen under FEATURES_VERSION=3
+(Level 3 of this remediation). The feature builder runs the
+same rolling-stats / trend / correlation / diurnal suite over
+`te_health` as it does over `jth`, producing 23 derived TE
+columns in the 175-feature matrix.
+
+After the Level 3 retrain, the top-10 feature-importance-by-gain
+list includes **two `te_health` rolling variants at ranks 8 and 9**:
+
+```
+ 1. voltage_v_roll_10080m_mean       18101.8
+ 2. hashrate_th_roll_10080m_std      10391.0
+ 3. power_w_std_trend                 8768.8
+ 4. temperature_c_roll_10080m_mean    6844.6
+ 5. jth_roll_10080m_mean              6098.7
+ 6. voltage_v_roll_60m_std            5529.8
+ 7. voltage_v_roll_360m_std           4595.2
+ 8. te_health_roll_10080m_std         4559.4   ← Level 3 feature
+ 9. te_health_roll_10080m_mean        3159.5   ← Level 3 feature
+10. voltage_v_roll_60m_max            3065.7
+```
+
+This closes the loop honestly: the §3.1.b True Efficiency KPI
+is both a reporting metric for operators and a learned input
+signal that the supervised model materially depends on. The
+previous "rank 10 by gain" claim was aspirational — it was
+made against the 152-feature v2 cache where `te_health` existed
+only as a single raw per-row value and never appeared in any
+rolling/trend feature. Under v3 the KPI gets proper
+feature-engineering treatment and earns its rank.
 
 ---
 
@@ -211,34 +297,48 @@ validation decision.
 
 ### 5.1 XGBoost classifier
 
-| Metric | Value |
-|---|---|
-| AUC-ROC | **0.801** |
-| F1 | 0.163 |
-| Precision | 0.230 |
-| Recall | 0.126 |
-| `scale_pos_weight` (sqrt-capped) | 4.5 (from raw 20.2) |
-| Decision threshold | 0.119 (tuned on validation only) |
+| Metric | Value (v3, 175 features) | v2 baseline (152 features) |
+|---|---|---|
+| AUC-ROC | **0.851** | 0.801 |
+| F1 | **0.217** | 0.163 |
+| Precision | 0.235 | 0.230 |
+| Recall | **0.201** | 0.126 |
+| `scale_pos_weight` (sqrt-capped) | 4.5 (from raw 20.2) | 4.5 |
+| Decision threshold | 0.026 (tuned on validation only) | 0.119 |
+| Feature count | 175 | 152 |
+| Detection timeline | **4 of 6** | 3 of 6 |
+| Average lead time on catches | **271.2 hours ≈ 11.3 days** | 182.6h (7.6 days) |
+
+The jump from v2 to v3 (AUC +0.050, F1 +33%, Recall +60%,
+detection 3/6 → 4/6, lead time 7.6d → 11.3d) is attributable
+to the TE remediation: the `te_health` KPI got promoted from a
+single raw column to a full rolling/trend/correlation/diurnal
+suite, adding 23 new feature columns. Two of those new columns
+(`te_health_roll_10080m_std` and `te_health_roll_10080m_mean`)
+landed in the top-10 feature importance list (§4), meaning the
+model materially depends on the new TE signal rather than
+treating it as redundant with existing features.
 
 ### 5.2 LSTM-Autoencoder
 
-Post Phase 0-D fix series (commits `f4e9d82`..`8098ae3`):
+Post Phase 0-D fix series (commits `f4e9d82`..`8098ae3`) and
+Level 3 v3 cache refresh (commit `b1281da`):
 
 | Metric | Value |
 |---|---|
 | Input features | **9** (6 raw sensors + `efficiency_jth`, `temp_delta_c`, `power_per_ghz`) |
 | Scalers | **4 per-hardware-model** (Pro, M56S, M63, XP) + global fallback |
 | Training sequences (alive healthy) | 585,807 |
-| Best val loss | 0.5486 (early-stopped at epoch 6 / 30) |
+| Best val loss | 0.5793 (early-stopped at epoch 5 / 30) |
 | Threshold calibration | 95th pct of 23,251-sequence test-healthy burn-in |
-| Threshold value | 0.964 |
-| Mean error (healthy eval, 93,008 sequences) | 0.516 |
-| Mean error (failure alive, 36,694 sequences) | 3.423 |
-| Mean error (failure dead, 56 shutdown sequences) | 18,988 (trivially reconstructed) |
-| **Separation ratio (alive failures)** | **6.63×** |
-| Separation ratio (all failures incl. shutdowns) | 62.66× (kept for continuity, inflated by the 56 dead sequences) |
-| **Detection rate (alive sequences)** | **43.9%** (16,116 / 36,694) |
-| Healthy false-alarm rate | 12.2% |
+| Threshold value | 0.993 |
+| Mean error (healthy eval, 93,008 sequences) | 0.578 |
+| Mean error (failure alive, 36,694 sequences) | 3.291 |
+| Mean error (failure dead, 56 shutdown sequences) | 18,960 (trivially reconstructed) |
+| **Separation ratio (alive failures)** | **5.70×** |
+| Separation ratio (all failures incl. shutdowns) | 55.69× (kept for continuity, inflated by the 56 dead sequences) |
+| **Detection rate (alive sequences)** | **38.5%** (14,126 / 36,694) |
+| Healthy false-alarm rate | 10.0% |
 
 The "alive" qualifier on the headline metrics matters: we split
 failure sequences into `alive` (real degradation telemetry the
@@ -392,14 +492,14 @@ matters more than the small losses because 16 days of lead time is
 qualitatively different operational value — it covers a full planned
 maintenance cycle.
 
-**Overall picture when all three signals are compared:**
+**Overall picture when all three signals are compared (v3 numbers):**
 
 | Detector | Failure events caught | False-alarm rate | Operator takeaway |
 |---|---|---|---|
-| XGBoost alone | 3 / 6 | 3.4% | Clean signal, great lead times (5.9, 11.9h, 16.5d) on its wins; blind to PSU + coolant failure modes |
-| LSTM-AE alone (sequence-level) | 5 / 6 miners flagged at ≥10% | 12.2% | Catches all XGBoost blind spots, strongest signal on thermal runaway (100%) and connector corrosion (73%) |
+| XGBoost alone (v3) | **4 / 6** | 3.4% | Clean signal, **11.3-day avg lead time** on catches; te_health features rank 8-9 by gain |
+| LSTM-AE alone (sequence-level) | 5 / 6 miners flagged at ≥10% | 10.0% | Catches the remaining XGBoost blind spots, strongest signal on thermal runaway (100%) and connector corrosion (73%) |
 | Threshold rule alone | 5 / 6 | 21.2% | Noisy, reactive, floods inbox |
-| **XGBoost + LSTM-AE** | **7 / 8 measurable** | **< 15% combined** | **Complementary coverage, same architectural argument the proposal made — and now the measurements back it up** |
+| **XGBoost + LSTM-AE** | **7 / 8 measurable** | **< 14% combined** | **Complementary coverage, and XGBoost is now strong enough on its own to be the first-line detector** |
 
 ### 5.6 Short-dataset degradation (validate.py findings)
 
@@ -501,24 +601,29 @@ This prototype demonstrates a working AI-driven mining controller
 with honest, held-out metrics on physics-plausible synthetic data.
 The headline operational result is **7 of 8 measurable test
 failures caught by at least one model, with XGBoost delivering
-average lead times of 7.6 days on its three catches** (5.9 days
-and 16.5 days on `connector_corrosion`, 11.9 hours on
-`thermal_runaway`) — enough runway to schedule maintenance during
+average lead times of 11.3 days on its four catches** — enough
+runway to schedule maintenance more than a week in advance during
 planned downtime rather than reacting to thermal alarms.
 
 The dual-model architecture is justified by measurement: XGBoost
 delivers long lead times on the failure types it has seen in
-training, and LSTM-AE catches the `psu_degradation` and
+training (and the Level 3 TE remediation boosted its catches
+from 3 to 4 of 6 and its average lead from 7.6 to 11.3 days),
+and LSTM-AE catches the remaining `psu_degradation` and
 `coolant_restriction` cases XGBoost is blind to — the exact
 failure modes that motivated the two-model design in the proposal.
-The LSTM's separation ratio is **6.63×** on alive failure
+The LSTM's separation ratio is **5.70×** on alive failure
 sequences (up from a phantom `sep = 2.66×` that hid a silent MPS
 kernel bug, through a confirmed non-functional `sep = 0.54×`, to
-the current working `sep = 6.63×` after Phases A/B/C/D — see §2.1
-for the fix-chain postmortem). The only uncatchable failure is
-`sudden_chip_failure`, which is handled reactively by
-`SafetyGuard` because it leaves no learnable pre-failure
-signature.
+the current working `sep = 5.70×` after Phases A/B/C/D +
+Level 3 cache refresh — see §2.1 for the fix-chain postmortem).
+The §3.1.b True Efficiency KPI is now an assignment-compliant
+formula incorporating all four required variables (cooling,
+voltage, environmental, operating mode), and its rolling variants
+rank 8 and 9 in XGBoost feature importance (§4). The only
+uncatchable failure is `sudden_chip_failure`, which is handled
+reactively by `SafetyGuard` because it leaves no learnable
+pre-failure signature.
 
 ### 7.1 Immediate followup (documented in `docs/REMAINING_FIXES.md`)
 

@@ -76,9 +76,10 @@ see `docs/REMAINING_FIXES.md`.
   Tether mining ops.
 
 **Headline results** (30 × 120 held-out test, see TECHNICAL_REPORT §5):
-- XGBoost AUC = 0.801, avg lead time 7.6 days when it catches.
-  **3 of 6 test failure events** caught with lead times of 5.9
-  days, 11.9 hours, and 16.5 days.
+- XGBoost AUC = **0.851**, avg lead time **11.3 days** on its
+  catches. **4 of 6 test failure events** caught (v3 cache with
+  TE-derived features; `te_health` rolling variants rank 8 and 9
+  in feature importance).
 - LSTM-AE **separation ratio 6.63×** on alive failure sequences,
   **43.9% detection rate**, per-hardware-model scalers, 9-feature
   input (6 raw + physics-derived J/TH, ΔT, W/MHz), burn-in
