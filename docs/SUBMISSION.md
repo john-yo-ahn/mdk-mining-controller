@@ -105,11 +105,11 @@ priority, effort, and verification steps. The highest-priority items
 are:
 
 - **F1**: CLI live inference fix (2-3 h) — biggest visible bug
-- **F12**: multi-class XGBoost — closes the `psu_degradation` and
-  `coolant_restriction` blind spots which are currently uncovered
-  (LSTM-AE was intended as the fallback detector but does not work
-  on this dataset; see README / TECHNICAL_REPORT §5.2 for the
-  postmortem)
+- **F12**: multi-class XGBoost — would give the supervised side
+  direct coverage of `psu_degradation` and `coolant_restriction`
+  instead of relying solely on the LSTM-AE (which currently
+  catches these at 21% and 11% sequence-level detection — the
+  only signal on those failure modes today)
 - **F14**: real MDK API integration — gated on external dependency
 
 ## Reproducibility

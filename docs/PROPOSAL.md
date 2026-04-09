@@ -69,23 +69,26 @@ see `docs/REMAINING_FIXES.md`.
   Documented and warned about at `AIBridge.load_models()` startup;
   planned for fix before demo.
 - F12: multi-class XGBoost targeting specific failure types (would
-  close the `psu_degradation` and `coolant_restriction` blind spots
-  which remain uncovered — the LSTM-AE was intended as the fallback
-  but does not work on this dataset; see TECHNICAL_REPORT §5.2).
+  give the supervised side direct coverage of `psu_degradation` and
+  `coolant_restriction` instead of relying solely on the LSTM-AE's
+  21% and 11% sequence-detection rates).
 - F14: real MDK API client — gated on a data sharing channel with
   Tether mining ops.
 
 **Headline results** (30 × 120 held-out test, see TECHNICAL_REPORT §5):
-- XGBoost AUC = 0.801, avg lead time 7.6 days when it catches
-- **3 of 6 test failures caught** by XGBoost, with the strongest
-  single result a 16.5-day lead time on `connector_corrosion`
+- XGBoost AUC = 0.801, avg lead time 7.6 days when it catches.
+  **3 of 6 test failure events** caught with lead times of 5.9
+  days, 11.9 hours, and 16.5 days.
+- LSTM-AE **separation ratio 6.63×** on alive failure sequences,
+  **43.9% detection rate**, per-hardware-model scalers, 9-feature
+  input (6 raw + physics-derived J/TH, ΔT, W/MHz), burn-in
+  threshold calibration. Catches the two XGBoost blind spots:
+  `psu_degradation` (21% vs XGBoost 0%) and `coolant_restriction`
+  (11% vs XGBoost 0%).
+- **Combined coverage: 7 of 8 measurable failure events caught by
+  at least one model.**
 - 6× lower false-alarm rate than a simple temperature + hashrate
-  threshold baseline
-- LSTM-AE code path complete but trained model non-functional on
-  this dataset (separation ratio inverted at 0.54×); XGBoost is the
-  sole working detector in this submission. Earlier drafts claimed
-  5/6 coverage with LSTM catching the two XGBoost misses — that was
-  a phantom from an Apple Silicon MPS kernel bug, now fixed.
+  threshold baseline.
 
 ---
 

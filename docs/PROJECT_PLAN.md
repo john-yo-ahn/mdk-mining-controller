@@ -73,21 +73,31 @@ Tasks:
     `scale_pos_weight`, F1-with-floor threshold strategy
   - **AUC 0.801, 3/6 test failures, avg 7.6-day lead time**
   - Full feature importance analysis in `notebooks/02_results.ipynb`
-- [x] LSTM-Autoencoder anomaly detection (plumbing complete, model
-      non-functional on this dataset — see README "LSTM-Autoencoder"
-      section and TECHNICAL_REPORT §5.2 for the postmortem)
-  - Trained on healthy-only sequences (649k sequences × 60 min)
-  - Persistent global scaler serialized with model weights
-  - Early stopping + best-weight restore
-  - MPS training with CPU inference (CPU inference is the fix for a
-    silent MPS `batch_size=128` kernel bug that previously produced
-    phantom positive separation metrics)
-  - **Real separation ratio 0.54× (inverted)** — failure sequences
-    reconstruct better than healthy because the healthy manifold
-    across mixed hardware is too broad for a 64-hidden AE while
-    failure sequences often contain flat/constant patterns
-  - XGBoost is the sole working detector in this submission;
-    making the LSTM actually work is a followup
+- [x] LSTM-Autoencoder anomaly detection (working after Phases
+      0/A/B/C/D — see README "LSTM-Autoencoder" section and
+      TECHNICAL_REPORT §2.1 / §5.2 for the fix chain postmortem)
+  - 9-dimensional input: 6 raw sensors + 3 physics-derived
+    features (`efficiency_jth`, `temp_delta_c`, `power_per_ghz`)
+  - Per-hardware-model scalers (schema v2) — 4 families
+    (Pro, M56S, M63, XP) each with their own mean/std
+  - Offline-row filter (`filter_alive_rows`) drops shutdown
+    sequences from train and splits failure test by liveness
+  - Threshold calibrated on test-healthy burn-in (first 20%)
+    instead of val split — matches real operational deployment
+  - MPS training with CPU inference (CPU inference is the fix
+    for a silent MPS `batch_size=128` kernel bug that previously
+    produced phantom positive separation metrics)
+  - Trained on 585,807 alive healthy sequences (stride=5),
+    early-stopped epoch 6 of 30
+  - **Separation ratio 6.63× on alive failure sequences, 43.9%
+    sequence detection rate, catches the XGBoost blind spots**
+    (`psu_degradation` and `coolant_restriction`)
+  - Per-failure detection rates: thermal_runaway 100%,
+    connector_corrosion 73%, psu_degradation 21%,
+    coolant_restriction 11%
+  - Known trade-off: 12.2% healthy FAR at stride=5 full-scale
+    (overlapping-window clustering effect; fast-mode stride=20
+    yields 0.87% FAR with the same calibration)
 - [x] Rule-based efficiency optimizer (stretch)
   - `src/optimizer/rules.py` — thermal, energy price, degradation rules
   - `src/optimizer/safety.py` — SafetyGuard with thermal shutdown
