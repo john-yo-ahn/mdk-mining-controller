@@ -14,6 +14,11 @@ from typing import Optional, List, Dict
 import numpy as np
 
 from .ai_bridge import AIBridge
+from ..kpi.true_efficiency import (
+    compute_te_base_scalar,
+    compute_te_adjusted_scalar,
+    compute_te_health_scalar,
+)
 from ..synthetic.scenarios import (
     SCENARIOS, list_scenarios, get_scenario,
     apply_scenario_effects, compute_progression,
@@ -374,15 +379,33 @@ class MiningFleetSimulation:
             miner.hashrate_th += self.rng.gauss(0, miner.hashrate_th * 0.008)
             miner.hashrate_th = max(0, miner.hashrate_th)
 
-            # KPIs
+            # KPIs — delegate to the canonical TE formula so the
+            # dashboard and the batch pipeline use identical math.
+            # Pre-Level-1 this block reimplemented TE inline and drifted
+            # (it was missing β_infra, giving TE values ~4.3% higher
+            # than the batch pipeline for the same telemetry). Now both
+            # code paths call the same helpers in src/kpi/true_efficiency.py.
             if miner.hashrate_th > 0:
                 miner.efficiency_jth = miner.power_w / miner.hashrate_th
-                cooling_power = miner.power_w * 0.15
-                miner.te_base = miner.hashrate_th / (miner.power_w + cooling_power)
-                temp_penalty = 1 - 0.008 * max(0, miner.ambient_c - 25)
-                realization = miner.hashrate_th / miner.spec.hashrate_nameplate_th
-                miner.hashrate_realization = min(1.0, realization)
-                miner.te_health = miner.te_base * temp_penalty * miner.hashrate_realization
+                miner.hashrate_realization = min(
+                    1.0, miner.hashrate_th / miner.spec.hashrate_nameplate_th,
+                )
+                miner.te_base = compute_te_base_scalar(
+                    hashrate_th=miner.hashrate_th,
+                    power_chip_w=miner.power_w,
+                    voltage_v=miner.voltage_v,
+                    voltage_default_v=miner.spec.voltage_default_v,
+                    operating_mode=miner.mode.value,
+                )
+                te_adjusted_val = compute_te_adjusted_scalar(
+                    te_base=miner.te_base,
+                    ambient_temp_c=miner.ambient_c,
+                )
+                miner.te_health = compute_te_health_scalar(
+                    te_adjusted=te_adjusted_val,
+                    hashrate_actual_th=miner.hashrate_th,
+                    hashrate_nameplate_th=miner.spec.hashrate_nameplate_th,
+                )
             else:
                 miner.efficiency_jth = float("inf")
                 miner.te_base = 0

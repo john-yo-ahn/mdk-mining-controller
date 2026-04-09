@@ -53,10 +53,11 @@ class RuleBasedOptimizer:
             miner_id, energy_price, current_frequency_mhz, temperature_c, spec,
         ))
 
-        # Degradation response
+        # Degradation response — two independent signals
         actions.extend(self._rule_degradation(
             miner_id, te_health, anomaly_score, predicted_failure,
         ))
+        actions.extend(self._rule_te_health_floor(miner_id, te_health))
 
         # Filter through safety guard
         approved = []
@@ -122,6 +123,17 @@ class RuleBasedOptimizer:
 
         return actions
 
+    # Threshold for the standalone te_health anomaly rule below.
+    # A miner whose te_health drops below this absolute floor gets
+    # flagged for inspection even if the supervised anomaly score
+    # is below the high-confidence cutoff. 0.005 was chosen by
+    # measuring the per-miner te_health distribution on the current
+    # feature cache: healthy miners sit around 0.035, failing
+    # miners' per-row te_health during the acceleration phase drops
+    # well below 0.01. 0.005 is a floor that only trips on
+    # genuinely degraded telemetry.
+    TE_HEALTH_FLOOR = 0.005
+
     def _rule_degradation(
         self,
         miner_id: str,
@@ -129,12 +141,56 @@ class RuleBasedOptimizer:
         anomaly_score: float,
         predicted_failure: bool,
     ) -> List[ControlAction]:
+        """
+        ML-driven flag rule. Fires on explicit model prediction
+        (predicted_failure=True) or high anomaly score from the
+        LSTM-AE. Kept separate from the TE-floor rule below so
+        the two signals (supervised + physics-KPI) are independently
+        attributable in the action log.
+        """
         actions = []
 
         if predicted_failure or anomaly_score > 0.7:
             actions.append(ControlAction(
                 miner_id, "flag_maintenance", 1,
                 f"AI prediction: anomaly_score={anomaly_score:.2f}", "high",
+            ))
+
+        return actions
+
+    def _rule_te_health_floor(
+        self,
+        miner_id: str,
+        te_health: float,
+    ) -> List[ControlAction]:
+        """
+        Physics-KPI degradation rule. Independent of the ML signal:
+        any miner whose True Efficiency collapses below TE_HEALTH_FLOOR
+        is flagged for maintenance inspection, because that's a strong
+        indicator that at least one of the four §3.1.b variables
+        (cooling, voltage, environment, operating mode) has gone
+        out of band in a way that's materially affecting the miner's
+        useful work output.
+
+        This rule was added in the Level-4 TE cleanup to wire the
+        te_health parameter (previously passed into _rule_degradation
+        but never read) into an actual decision. It means a miner
+        can be flagged by either the supervised ML signal (anomaly
+        score) OR by the physics KPI (te_health floor), giving the
+        operator two independent signals to cross-reference.
+
+        te_health=0 is treated as "no telemetry" (Shutdown/Idle or
+        dead miner) and explicitly NOT flagged — those miners are
+        already off and don't need a maintenance flag.
+        """
+        actions = []
+
+        if 0 < te_health < self.TE_HEALTH_FLOOR:
+            actions.append(ControlAction(
+                miner_id, "flag_maintenance", 1,
+                f"TE floor breach: te_health={te_health:.5f} "
+                f"< {self.TE_HEALTH_FLOOR}",
+                "medium",
             ))
 
         return actions
