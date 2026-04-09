@@ -1,10 +1,10 @@
 {
   "extra": {
-    "features_version": 2
+    "features_version": 3
   },
   "feature_count": 9,
   "feature_names_hash": "9af2347237de5667",
-  "git_commit": "255c69d42ea60d30be77187c0b40a4379a05f886",
+  "git_commit": "e9a14892bc815a1e07288afe734008148555873d",
   "git_dirty": true,
   "model_file": "lstm_ae.pt",
   "model_type": "lstm_autoencoder",
@@ -23,26 +23,26 @@
     "n_layers": 2,
     "seq_len": 60,
     "threshold_percentile": 95.0,
-    "threshold_value": 0.9642199277877808,
+    "threshold_value": 0.9929590821266174,
     "trainer": "scripts/train_lstm_only.py (standalone)"
   },
-  "training_date_utc": "2026-04-08T15:46:45.625148+00:00",
+  "training_date_utc": "2026-04-09T04:38:50.992322+00:00",
   "val_metrics": {
-    "best_val_loss": 0.548631489276886,
+    "best_val_loss": 0.5793198347091675,
     "burn_in_size": 23251.0,
-    "test_detection_rate_alive": 0.4391998691884232,
-    "test_detection_rate_all": 0.44005442176870746,
-    "test_failure_detection_rate": 0.44005442176870746,
-    "test_healthy_far": 0.1218604851195596,
-    "test_mean_error_failure": 32.35268783569336,
-    "test_mean_error_failure_alive": 3.423438549041748,
-    "test_mean_error_failure_dead": 18988.240234375,
-    "test_mean_error_healthy": 0.5163329839706421,
+    "test_detection_rate_alive": 0.3852945985719736,
+    "test_detection_rate_all": 0.38623129251700683,
+    "test_failure_detection_rate": 0.38623129251700683,
+    "test_healthy_far": 0.1003354550146224,
+    "test_mean_error_failure": 32.17688751220703,
+    "test_mean_error_failure_alive": 3.290701150894165,
+    "test_mean_error_failure_dead": 18959.853515625,
+    "test_mean_error_healthy": 0.5777985453605652,
     "test_n_failure_alive": 36694.0,
     "test_n_failure_dead": 56.0,
-    "test_separation_ratio": 62.65857274291987,
-    "test_separation_ratio_alive": 6.630292186091291,
-    "test_separation_ratio_all": 62.65857274291987,
+    "test_separation_ratio": 55.688765177017885,
+    "test_separation_ratio_alive": 5.695239590540436,
+    "test_separation_ratio_all": 55.688765177017885,
     "threshold_calibration": "test_healthy_burn_in_20pct"
   }
 }

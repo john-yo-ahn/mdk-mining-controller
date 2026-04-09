@@ -39,7 +39,18 @@ from ..config import FeatureConfig, DEFAULT_MINER_SPECS, FEATURE_EXCLUDE_COLUMNS
 #        derived from degradation_phase instead of scheduled phase
 #        durations). Same feature columns, but labels differ, so cached
 #        features from v1 will train a different model.
-FEATURES_VERSION = 2
+#   v3 — Apr 9: te_health promoted to a first-class feature-engineering
+#        citizen. The True Efficiency KPI formula was rewritten in
+#        commit 0605590 to incorporate all 4 assignment §3.1.b variables
+#        (cooling, voltage, environmental, operating_mode); this cache
+#        version runs the rolling-stats / trend / correlation / diurnal
+#        suite over te_health alongside jth, so XGBoost actually gets
+#        the new TE signal as inputs instead of a single raw per-row
+#        value. Feature count rises from 152 to ~181. Also fixes a
+#        silent bug in the v2 cache where Pro and XP miners had
+#        hashrate_nameplate_th = 0 (see commit 0605590 for details),
+#        so te_health is now nonzero for all four hardware models.
+FEATURES_VERSION = 3
 
 
 # ─── Cross-signal ratios ─────────────────────────────────────────────
@@ -450,7 +461,13 @@ def build_feature_matrix(
         print("Building feature matrix...")
 
     sensor_cols = ["temperature_c", "hashrate_th", "power_w", "voltage_v"]
-    trend_cols = ["temperature_c", "hashrate_th", "power_w", "jth", "voltage_v"]
+    # te_health joins the trend list alongside jth as of FEATURES_VERSION=3.
+    # te_base and te_adjusted deliberately do NOT get the full treatment
+    # because their per-row separation is near zero on this synthetic data
+    # (see docs/TECHNICAL_REPORT.md §4 for the audit); te_health is where
+    # the signal lives because of the hashrate_realization multiplier.
+    trend_cols = ["temperature_c", "hashrate_th", "power_w",
+                  "jth", "voltage_v", "te_health"]
     variance_cols = ["hashrate_th", "voltage_v", "power_w"]
 
     # 1. Cross-signal ratios
@@ -458,7 +475,12 @@ def build_feature_matrix(
     if verbose: print(f"  After ratios:          {len(df.columns)} cols")
 
     # 2. Rolling statistics (multi-timescale)
-    df = compute_rolling_stats(df, sensor_cols + ["jth"], config.rolling_windows_minutes)
+    # te_health added alongside jth as of FEATURES_VERSION=3 — the KPI
+    # gets the same 6-window mean/std/min/max treatment as the raw
+    # efficiency signal, so XGBoost can actually learn trends in the
+    # composite metric instead of only seeing the raw per-row value.
+    df = compute_rolling_stats(df, sensor_cols + ["jth", "te_health"],
+                               config.rolling_windows_minutes)
     if verbose: print(f"  After rolling stats:   {len(df.columns)} cols")
 
     # 3. Rate of change
@@ -478,11 +500,16 @@ def build_feature_matrix(
     if verbose: print(f"  After variance trends: {len(df.columns)} cols")
 
     # 7. Cross-signal correlations
+    # te_health × temperature_c pair added in v3: a degrading chip will
+    # typically show te_health dropping while its temperature rises (or
+    # drops if throttling is engaging), so their rolling correlation
+    # carries an early-warning signal the raw stats miss.
     pairs = [
         ("temperature_c", "power_w"),
         ("hashrate_th", "voltage_v"),
         ("jth", "temperature_c"),
         ("power_w", "clock_frequency_mhz"),
+        ("te_health", "temperature_c"),
     ]
     df = compute_cross_signal_correlations(df, pairs, config.correlation_window_minutes)
     if verbose: print(f"  After correlations:    {len(df.columns)} cols")
@@ -497,8 +524,14 @@ def build_feature_matrix(
     if verbose: print(f"  After peak counts:     {len(df.columns)} cols")
 
     # 10. Diurnal amplitude
+    # te_health diurnal added in v3 — a healthy miner's TE follows a
+    # daily thermal cycle as ambient swings, and the amplitude of that
+    # cycle is itself a health indicator (too large → chip is
+    # over-sensitive to environment, too small → something is suppressing
+    # the normal daily variation, e.g. throttled + stuck).
     df = compute_diurnal_amplitude(df, "jth", config.diurnal_amplitude_window_hours)
     df = compute_diurnal_amplitude(df, "temperature_c", config.diurnal_amplitude_window_hours)
+    df = compute_diurnal_amplitude(df, "te_health", config.diurnal_amplitude_window_hours)
     if verbose: print(f"  After diurnal:         {len(df.columns)} cols")
 
     # 11. Cross-miner features

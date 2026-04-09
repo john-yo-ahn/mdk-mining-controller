@@ -1,13 +1,12 @@
 {
   "extra": {
-    "features_version": 2,
-    "note": "backfilled from committed model; training run was commit fbb9f73",
-    "test_failures_detected": 3,
+    "features_version": 3,
+    "test_failures_detected": 4,
     "test_failures_total": 6
   },
-  "feature_count": 152,
-  "feature_names_hash": "5da60ae01dac84b1",
-  "git_commit": "fbb9f73020bf87ed615b51f6ae582d3f9caf7bc4",
+  "feature_count": 175,
+  "feature_names_hash": "e63ac8737666c65c",
+  "git_commit": "e9a14892bc815a1e07288afe734008148555873d",
   "git_dirty": true,
   "model_file": "xgboost_failure.joblib",
   "model_type": "xgboost_binary",
@@ -22,16 +21,16 @@
     "scale_pos_weight": "sqrt-capped",
     "split": "split_temporal_tvt(0.55, 0.15)",
     "threshold_strategy": "f1_with_floor",
-    "threshold_value": 0.11855974048376083,
+    "threshold_value": 0.026287296786904335,
     "tree_method": "hist"
   },
-  "training_date_utc": "2026-04-08T10:08:41.241760+00:00",
+  "training_date_utc": "2026-04-09T04:03:20.071287+00:00",
   "val_metrics": {
-    "accuracy": 0.9040300442917529,
-    "auc_pr": 0.194214988531654,
-    "auc_roc": 0.8009811323752757,
-    "f1": 0.16316430973464324,
-    "precision": 0.23009381018451408,
-    "recall": 0.1263978158239008
+    "accuracy": 0.8923196753060847,
+    "auc_pr": 0.23087607881138103,
+    "auc_roc": 0.851416758823419,
+    "f1": 0.21685477895020486,
+    "precision": 0.23486416215642578,
+    "recall": 0.20141061373073205
   }
 }

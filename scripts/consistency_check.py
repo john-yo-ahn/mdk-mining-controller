@@ -125,7 +125,11 @@ def check_model_load():
     assert xgb.threshold_ is not None
     assert 0 < xgb.threshold_ < 1, f"threshold {xgb.threshold_} out of [0,1]"
     assert xgb.feature_names_ is not None
-    assert len(xgb.feature_names_) == 152, f"expected 152 features, got {len(xgb.feature_names_)}"
+    # 175 features as of FEATURES_VERSION=3 (Level 3 TE remediation):
+    # the prior 152-col set plus 23 te_health-derived columns
+    # (rolling stats × 6 windows, rate of change, trend, variance
+    # trend, 1 correlation pair, diurnal amplitude).
+    assert len(xgb.feature_names_) == 175, f"expected 175 features, got {len(xgb.feature_names_)}"
 
     lstm = AnomalyDetector.load()
     assert lstm.model_ is not None
@@ -160,7 +164,7 @@ def check_metadata_sidecars():
     assert xgb_meta is not None, "XGBoost sidecar missing"
     assert xgb_meta["schema_version"] == 1
     assert xgb_meta["model_type"] == "xgboost_binary"
-    assert xgb_meta["feature_count"] == 152
+    assert xgb_meta["feature_count"] == 175
     assert "git_commit" in xgb_meta
     assert "val_metrics" in xgb_meta
     assert "auc_roc" in xgb_meta["val_metrics"]
@@ -247,8 +251,14 @@ def check_xgboost_reproducibility():
     return f"AUC={metrics['auc_roc']:.3f} F1={metrics['f1']:.3f} matches sidecar"
 
 
-@check("8. XGBoost detection timeline reproduces 3/6 catches")
+@check("8. XGBoost detection timeline reproduces 4/6 catches")
 def check_detection_timeline():
+    """
+    Detection timeline after the FEATURES_VERSION=3 retrain
+    (TE remediation Level 3 commit). The 175-feature XGBoost model
+    catches 4 of 6 test failures with an average lead time of
+    ~271 hours (~11.3 days), up from 3/6 at 182h under v2.
+    """
     from src.config import PROCESSED_DIR
     from src.pipeline.features import split_temporal_tvt, get_feature_columns, FEATURES_VERSION
     from src.models.xgboost_classifier import MinerFailureClassifier
@@ -267,12 +277,12 @@ def check_detection_timeline():
     n_total = len(timeline)
     n_detected = int(timeline["detected"].sum())
     assert n_total == 6, f"expected 6 test failures, got {n_total}"
-    assert n_detected == 3, f"expected 3/6 detected, got {n_detected}/{n_total}"
+    assert n_detected == 4, f"expected 4/6 detected, got {n_detected}/{n_total}"
 
     if n_detected > 0:
         avg_lead = timeline[timeline["detected"]]["lead_time_hours"].mean()
-        # Report reports 182.6h; allow ±1h drift
-        assert 180 < avg_lead < 185, f"avg lead time {avg_lead:.1f}h not near 182.6h"
+        # Retrain reports ~271h; allow ±3h drift
+        assert 268 < avg_lead < 274, f"avg lead time {avg_lead:.1f}h not near 271h"
 
     return f"{n_detected}/{n_total} detected, avg lead {avg_lead:.1f}h"
 
@@ -436,7 +446,9 @@ def check_ai_bridge_smoke():
 
     ai = AIBridge()
     assert ai.load_models(), "load_models returned False"
-    assert len(ai.xgb_features) == 152
+    assert len(ai.xgb_features) == 175, (
+        f"expected 175 features (v3), got {len(ai.xgb_features)}"
+    )
     assert ai.lstm_model is not None
     assert (
         ai.lstm_model.feature_scalers_

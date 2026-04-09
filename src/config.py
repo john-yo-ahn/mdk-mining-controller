@@ -404,5 +404,11 @@ FEATURE_EXCLUDE_COLUMNS = {
     "operating_mode", "failure_type", "is_pre_failure",
     "degradation_phase", "days_to_failure", "scenario_name",
     "hashrate_nameplate_th", "hashrate_realization",
+    # Exclude voltage_default_v — it's added by compute_all_te_variants
+    # in FEATURES_VERSION=3 but is a constant per hardware model, so it
+    # would act as a model-ID label leakage feature if left in the
+    # feature matrix. The useful voltage signal is already captured by
+    # the voltage_v column + its rolling stats.
+    "voltage_default_v",
     *PHYSICS_TRACE_COLUMNS,
 }

@@ -21,6 +21,8 @@ number. te_base and te_adjusted are exposed for introspection
 operator KPIs.
 """
 
+from typing import Dict
+
 import numpy as np
 import pandas as pd
 
@@ -165,17 +167,28 @@ def compute_all_te_variants(
     """
     df = df.copy()
 
-    # Per-model nameplate + default voltage lookup. DEFAULT_MINER_SPECS
-    # keys are the short tokens the generator writes into the `model`
-    # column ("Pro", "M56S", "M63", "XP"), so the map is direct.
-    nameplate_map = {
-        _spec_short_key(k, spec): spec.hashrate_nameplate_th
-        for k, spec in DEFAULT_MINER_SPECS.items()
-    }
-    voltage_default_map = {
-        _spec_short_key(k, spec): spec.voltage_default_v
-        for k, spec in DEFAULT_MINER_SPECS.items()
-    }
+    # Per-model nameplate + default voltage lookup.
+    #
+    # The synthetic generator writes the short token ("Pro", "M56S",
+    # "M63", "XP") into the `model` column of batch telemetry, so
+    # _spec_short_key() gives us the right key for that path.
+    #
+    # But the live CLI bridge (src/cli/ai_bridge.py:MinerBuffer.to_dataframe)
+    # sets model to the full spec name ("Antminer S21 Pro"), and
+    # src/cli/simulation.py passes the same full name into register_miner.
+    # To make both paths resolve without requiring the caller to know
+    # which convention to use, we build each lookup map with BOTH keys:
+    # the short token AND the full spec.model_name pointing at the
+    # same value.
+    nameplate_map: Dict[str, float] = {}
+    voltage_default_map: Dict[str, float] = {}
+    for k, spec in DEFAULT_MINER_SPECS.items():
+        short = _spec_short_key(k, spec)
+        full = str(spec.model_name)
+        nameplate_map[short] = spec.hashrate_nameplate_th
+        nameplate_map[full] = spec.hashrate_nameplate_th
+        voltage_default_map[short] = spec.voltage_default_v
+        voltage_default_map[full] = spec.voltage_default_v
 
     df["hashrate_nameplate_th"] = df["model"].map(nameplate_map)
     df["voltage_default_v"] = df["model"].map(voltage_default_map)
