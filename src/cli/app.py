@@ -238,7 +238,7 @@ class MiningDashboard(App):
         lib.update("\n".join(lines))
 
         # Start sim
-        self._tick_timer = self.set_interval(0.2, self._sim_tick)
+        self._tick_timer = self.set_interval(0.3, self._sim_tick)
 
     # ── Tick ──────────────────────────────────────────────────────
 
@@ -259,7 +259,7 @@ class MiningDashboard(App):
 
         self._update_kpis()  # always update — only 6 labels, cheap
 
-        if active_tab == "tab-fleet":
+        if active_tab == "tab-fleet" and self.sim.step % 2 == 0:
             self._update_fleet_table()
         elif active_tab == "tab-alerts":
             self._update_alerts()

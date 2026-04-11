@@ -437,17 +437,24 @@ class MiningFleetSimulation:
                 miner.temperature_c, miner.power_w, miner.ambient_c,
             )
 
-            # AI predictions with risk levels (health feeds into risk assessment)
-            if self._ai_ready:
-                miner.anomaly_score, miner.predicted_failure = self.ai.predict(
-                    miner.miner_id, health_score=miner.health_score,
-                )
-                risk = self.ai._risk_levels.get(miner.miner_id, "LOW")
-                if risk == "LOW" and miner.is_flagged:
-                    miner.is_flagged = False
-            else:
-                miner.anomaly_score = self._compute_anomaly_score(miner)
-                miner.predicted_failure = miner.anomaly_score > 0.7
+            # AI predictions — run every 30 ticks (6 seconds sim time)
+            # to avoid calling the full 175-feature pipeline (preprocess
+            # → TE → build_feature_matrix on 10k-row buffer) for every
+            # miner every 200ms tick. That was the #1 performance
+            # bottleneck — 24 miners × full feature build × 5Hz = the
+            # entire CPU budget consumed by inference alone.
+            # Between prediction ticks, scores hold their last value.
+            if self.step % 30 == 0:
+                if self._ai_ready:
+                    miner.anomaly_score, miner.predicted_failure = self.ai.predict(
+                        miner.miner_id, health_score=miner.health_score,
+                    )
+                    risk = self.ai._risk_levels.get(miner.miner_id, "LOW")
+                    if risk == "LOW" and miner.is_flagged:
+                        miner.is_flagged = False
+                else:
+                    miner.anomaly_score = self._compute_anomaly_score(miner)
+                    miner.predicted_failure = miner.anomaly_score > 0.7
 
             # Append to sparkline history deques (after all values finalized)
             miner.te_health_history.append(miner.te_health)
