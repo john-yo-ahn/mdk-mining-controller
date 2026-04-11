@@ -16,12 +16,12 @@ from textual.widgets import (
     RichLog,
     Rule,
     Select,
-    Sparkline,
     Static,
     TabbedContent,
     TabPane,
 )
 from textual.binding import Binding
+from textual_plotext import PlotextPlot
 
 import numpy as np
 from rich.text import Text
@@ -58,54 +58,9 @@ class MetricCard(Static):
             pass
 
 
-# ─── Sparkline configuration ────────────────────────────────────────
+# ─── Chart configuration ────────────────────────────────────────────
 
-SPARKLINE_WINDOW = 60  # last 60 simulated minutes shown in each sparkline
-
-# Each metric has fixed display bounds (y_min, y_max) so the graph
-# shows meaningful position within the operational range instead of
-# auto-scaling tiny healthy-state fluctuations into full-height bars.
-# Without fixed bounds, a healthy miner at 72±1°C produces a noisy
-# blocky graph that fills the whole height — useless. With bounds
-# of (20, 100) the same data renders as a calm line near the 72%
-# mark, and a thermal runaway climbs visibly toward the top.
-#
-# (metric_id, label, unit, source, field, min_color, max_color, y_min, y_max)
-SPARKLINE_METRICS = [
-    ("temp",       "Temperature",   "°C",   "buffer",  "temperature_c",    "#22cc22", "#ff4444",  20.0, 100.0),
-    ("hashrate",   "Hashrate",      "TH/s", "buffer",  "hashrate_th",      "#2266ff", "#22ccff",   0.0, 400.0),
-    ("power",      "Power",         "W",    "buffer",  "power_w",          "#ffaa00", "#ff4444",   0.0, 8000.0),
-    ("efficiency", "J/TH",          "J/TH", "derived", "efficiency_jth",   "#22cc22", "#ffaa00",  10.0,  40.0),
-    ("te_health",  "TE Health",     "",     "deque",   "te_health_history", "#22cc22", "#ff4444",   0.0,   0.08),
-    ("anomaly",    "Anomaly Score", "",     "deque",   "anomaly_score_history", "#22cc22", "#ff4444", 0.0, 1.0),
-    ("health",     "Health Score",  "",     "deque",   "health_score_history",  "#ff4444", "#22cc22", 0.0, 1.0),
-]
-
-
-class SparklineRow(Static):
-    """One metric row: label with current value + a live sparkline graph."""
-
-    def __init__(self, metric_id: str, label: str, unit: str,
-                 min_color: str, max_color: str):
-        super().__init__(id=f"spark-row-{metric_id}")
-        self._metric_id = metric_id
-        self._label = label
-        self._unit = unit
-        self._min_color = min_color
-        self._max_color = max_color
-
-    def compose(self) -> ComposeResult:
-        with Horizontal(classes="spark-row"):
-            yield Label(
-                f"  {self._label}: --",
-                id=f"spark-label-{self._metric_id}",
-                classes="spark-label",
-            )
-            yield Sparkline(
-                data=[0.0, 0.0],
-                id=f"spark-{self._metric_id}",
-                classes="spark-graph",
-            )
+CHART_WINDOW = 120  # last 120 simulated minutes shown in each chart
 
 
 # ─── Main Dashboard App ──────────────────────────────────────────────
@@ -129,11 +84,8 @@ class MiningDashboard(App):
     #detail-panel { height: 1fr; padding: 1; }
     #actions-log { height: 1fr; border: round $success; }
 
-    /* ── Sparkline rows in Miner Detail ── */
-    .spark-row { height: 2; padding: 0 1; }
-    .spark-label { width: 30; height: 2; content-align: left middle; }
-    .spark-graph { width: 1fr; height: 2; }
-    SparklineRow { height: auto; }
+    /* ── Plotext charts in Miner Detail ── */
+    .detail-chart { height: 16; margin: 0 1; }
 
     /* ── Scenarios tab ── */
     #scenarios-panel { height: 1fr; padding: 1; }
@@ -197,20 +149,14 @@ class MiningDashboard(App):
                 with TabPane("Alerts", id="tab-alerts"):
                     yield RichLog(id="alert-log", highlight=True, max_lines=200, markup=True)
 
-                # Tab 3: Miner Detail (with live sparkline graphs)
+                # Tab 3: Miner Detail (with plotext line charts)
                 with TabPane("Miner Detail", id="tab-detail"):
                     with VerticalScroll(id="detail-panel"):
                         yield Label("Select a miner from Fleet Overview (click a row)", id="detail-header")
                         yield Rule()
                         yield Static(id="detail-info")
-                        yield Rule()
-                        yield Label("[bold underline]Live Telemetry[/]")
-                        for cfg in SPARKLINE_METRICS[:4]:
-                            yield SparklineRow(cfg[0], cfg[1], cfg[2], cfg[5], cfg[6])
-                        yield Rule()
-                        yield Label("[bold underline]AI Signals[/]")
-                        for cfg in SPARKLINE_METRICS[4:]:
-                            yield SparklineRow(cfg[0], cfg[1], cfg[2], cfg[5], cfg[6])
+                        yield PlotextPlot(id="chart-telemetry", classes="detail-chart")
+                        yield PlotextPlot(id="chart-ai", classes="detail-chart")
                         yield Rule()
                         yield Static(id="detail-ai-text")
 
@@ -476,20 +422,19 @@ class MiningDashboard(App):
                 log.write(Text.from_markup(
                     f"  {ts}  [dim] ACT [/dim]  {mid}  {action.reason}\n"))
 
-    # ── Miner Detail (with live sparkline graphs + AI breakdown) ──
+    # ── Miner Detail (with plotext line charts + AI breakdown) ──
 
     def _update_detail(self) -> None:
         """
-        Update the Miner Detail tab with live sparklines and AI text.
+        Update the Miner Detail tab with plotext charts and AI text.
 
-        The tab has three sections:
-          1. detail-info: operating mode, health %, uptime (text)
-          2. SparklineRows: 4 telemetry + 3 AI signal sparklines
-          3. detail-ai-text: XGBoost/LSTM scores, risk, features (text)
+        Two charts:
+          1. Telemetry: temperature + hashrate + power + J/TH
+          2. AI signals: anomaly score + health score + TE health
 
-        Sparklines update every tick (200 ms). The AI text block
-        updates every 5 ticks (1 second) because it calls
-        get_detailed_scores which is heavier.
+        Charts update every 3 ticks (~600ms) for smooth animation
+        without excessive rendering overhead. The AI text block
+        updates every 5 ticks.
         """
         miner = next(
             (m for m in self.sim.miners if m.miner_id == self.selected_miner_id),
@@ -522,62 +467,78 @@ class MiningDashboard(App):
             except Exception:
                 pass
 
-            # ── Sparklines ──
-            buf = self.sim.ai.buffers.get(miner.miner_id)
-            for cfg in SPARKLINE_METRICS:
-                (metric_id, label, unit, source_type, field_name,
-                 _, _, y_min, y_max) = cfg
+            # ── Charts (every 3 ticks for performance) ──
+            if self.sim.step % 3 == 0:
+                self._update_charts(miner)
 
-                # Extract data
-                if source_type == "buffer" and buf:
-                    arr = buf.get_ordered(field_name)
-                    data = arr[-SPARKLINE_WINDOW:].tolist()
-                elif source_type == "deque":
-                    raw = list(getattr(miner, field_name, []))
-                    data = raw[-SPARKLINE_WINDOW:]
-                elif source_type == "derived" and buf:
-                    pwr = buf.get_ordered("power_w")[-SPARKLINE_WINDOW:]
-                    hr = buf.get_ordered("hashrate_th")[-SPARKLINE_WINDOW:]
-                    hr_safe = np.maximum(hr, 0.001)
-                    data = (pwr / hr_safe).tolist()
-                else:
-                    data = [0.0, 0.0]
-
-                current = data[-1] if len(data) > 0 else 0.0
-
-                # Normalize data to fixed [y_min, y_max] range so the
-                # sparkline shows meaningful position within the
-                # operational range instead of auto-scaling noise.
-                # A healthy miner at 72°C renders near the 65% mark
-                # of a [20, 100] range; a thermal runaway at 95°C
-                # climbs visibly toward the top.
-                y_range = max(y_max - y_min, 1e-6)
-                data = [
-                    max(0.0, min(1.0, (v - y_min) / y_range))
-                    for v in data
-                ]
-
-                # Update label with current value
-                try:
-                    lbl = self.query_one(f"#spark-label-{metric_id}", Label)
-                    if unit:
-                        lbl.update(f"  {label}: {current:.1f} {unit}")
-                    else:
-                        lbl.update(f"  {label}: {current:.4f}")
-                except Exception:
-                    pass
-
-                # Update sparkline data
-                try:
-                    spark = self.query_one(f"#spark-{metric_id}", Sparkline)
-                    spark.data = data if len(data) > 1 else [0.0, 0.0]
-                except Exception:
-                    pass
-
-            # ── AI text block (every 5 ticks for performance) ──
+            # ── AI text block (every 5 ticks) ──
             if self.sim.step % 5 == 0:
                 self._update_ai_text(miner)
 
+        except Exception:
+            pass
+
+    def _update_charts(self, miner: MinerState) -> None:
+        """Render plotext line charts for telemetry and AI signals."""
+        buf = self.sim.ai.buffers.get(miner.miner_id)
+        if not buf or buf.length < 2:
+            return
+
+        W = CHART_WINDOW
+
+        # ── Extract telemetry data ──
+        temp = buf.get_ordered("temperature_c")[-W:]
+        hr = buf.get_ordered("hashrate_th")[-W:]
+        pwr = buf.get_ordered("power_w")[-W:]
+        hr_safe = np.maximum(hr, 0.001)
+        jth = (pwr / hr_safe)
+        x = list(range(len(temp)))
+
+        # ── Chart 1: Telemetry ──
+        try:
+            chart_widget = self.query_one("#chart-telemetry", PlotextPlot)
+            plt = chart_widget.plt
+            plt.clear_figure()
+            plt.theme("dark")
+            plt.title("Live Telemetry (last 2 hours)")
+            plt.xlabel("minutes ago")
+
+            plt.plot(x, temp.tolist(), label=f"Temp {temp[-1]:.0f}°C", color="red")
+            plt.plot(x, hr.tolist(), label=f"Hash {hr[-1]:.0f} TH/s", color="cyan")
+            plt.plot(x, (pwr / 100).tolist(), label=f"Power {pwr[-1]:.0f}W (÷100)", color="yellow")
+            plt.plot(x, jth.tolist(), label=f"J/TH {jth[-1]:.1f}", color="green")
+
+            plt.ylim(0, max(float(temp.max()), float(hr.max()), 100) * 1.15)
+            chart_widget.refresh()
+        except Exception:
+            pass
+
+        # ── Chart 2: AI Signals ──
+        te_hist = list(miner.te_health_history)[-W:]
+        anom_hist = list(miner.anomaly_score_history)[-W:]
+        health_hist = list(miner.health_score_history)[-W:]
+
+        if len(te_hist) < 2:
+            return
+
+        x2 = list(range(len(health_hist)))
+
+        try:
+            chart_widget2 = self.query_one("#chart-ai", PlotextPlot)
+            plt2 = chart_widget2.plt
+            plt2.clear_figure()
+            plt2.theme("dark")
+            plt2.title("AI Signals (last 2 hours)")
+            plt2.xlabel("minutes ago")
+
+            plt2.plot(x2, health_hist, label=f"Health {health_hist[-1]:.2f}", color="green")
+            plt2.plot(x2, anom_hist, label=f"Anomaly {anom_hist[-1]:.3f}", color="red")
+            # TE health is ~0.05 scale, multiply by 10 to make visible alongside 0-1 signals
+            te_scaled = [v * 10 for v in te_hist]
+            plt2.plot(x2[:len(te_scaled)], te_scaled, label=f"TE×10 {te_hist[-1]:.4f}", color="cyan")
+
+            plt2.ylim(0, 1.1)
+            chart_widget2.refresh()
         except Exception:
             pass
 
