@@ -4,6 +4,7 @@ Uses the scenario engine for data-driven failure injection.
 Connects to trained AI models via the AI bridge.
 """
 
+import collections
 import math
 import random
 import time
@@ -145,6 +146,19 @@ class MinerState:
     is_flagged: bool = False
     predicted_failure: bool = False
     anomaly_score: float = 0.0
+
+    # History deques for sparkline graphs in the TUI detail panel.
+    # 360 points = 6 hours at 1-min sampling. Enough for the 60-point
+    # sparkline window with room for future zoom/pan.
+    te_health_history: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=360)
+    )
+    anomaly_score_history: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=360)
+    )
+    health_score_history: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=360)
+    )
 
     # Scenario engine fields
     _step: int = 0
@@ -434,6 +448,11 @@ class MiningFleetSimulation:
             else:
                 miner.anomaly_score = self._compute_anomaly_score(miner)
                 miner.predicted_failure = miner.anomaly_score > 0.7
+
+            # Append to sparkline history deques (after all values finalized)
+            miner.te_health_history.append(miner.te_health)
+            miner.anomaly_score_history.append(miner.anomaly_score)
+            miner.health_score_history.append(miner.health_score)
 
             # Optimizer + alerts
             new_actions.extend(self._run_optimizer(miner))

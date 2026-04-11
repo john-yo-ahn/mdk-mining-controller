@@ -16,12 +16,14 @@ from textual.widgets import (
     RichLog,
     Rule,
     Select,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
 )
 from textual.binding import Binding
 
+import numpy as np
 from rich.text import Text
 
 from .simulation import (
@@ -56,6 +58,49 @@ class MetricCard(Static):
             pass
 
 
+# ─── Sparkline configuration ────────────────────────────────────────
+
+SPARKLINE_WINDOW = 60  # last 60 simulated minutes shown in each sparkline
+
+# (metric_id, label, unit, data_source, field_name, min_color, max_color)
+# data_source: "buffer" = MinerBuffer ring, "deque" = MinerState deque, "derived" = computed
+SPARKLINE_METRICS = [
+    ("temp",       "Temperature",   "°C",   "buffer",  "temperature_c",          "#22cc22", "#ff4444"),
+    ("hashrate",   "Hashrate",      "TH/s", "buffer",  "hashrate_th",            "#2266ff", "#22ccff"),
+    ("power",      "Power",         "W",    "buffer",  "power_w",                "#ffaa00", "#ff4444"),
+    ("efficiency", "J/TH",          "J/TH", "derived", "efficiency_jth",         "#22cc22", "#ffaa00"),
+    ("te_health",  "TE Health",     "",     "deque",   "te_health_history",       "#22cc22", "#ff4444"),
+    ("anomaly",    "Anomaly Score", "",     "deque",   "anomaly_score_history",   "#22cc22", "#ff4444"),
+    ("health",     "Health Score",  "",     "deque",   "health_score_history",    "#ff4444", "#22cc22"),
+]
+
+
+class SparklineRow(Static):
+    """One metric row: label with current value + a live sparkline graph."""
+
+    def __init__(self, metric_id: str, label: str, unit: str,
+                 min_color: str, max_color: str):
+        super().__init__(id=f"spark-row-{metric_id}")
+        self._metric_id = metric_id
+        self._label = label
+        self._unit = unit
+        self._min_color = min_color
+        self._max_color = max_color
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="spark-row"):
+            yield Label(
+                f"  {self._label}: --",
+                id=f"spark-label-{self._metric_id}",
+                classes="spark-label",
+            )
+            yield Sparkline(
+                data=[0.0, 0.0],
+                id=f"spark-{self._metric_id}",
+                classes="spark-graph",
+            )
+
+
 # ─── Main Dashboard App ──────────────────────────────────────────────
 
 class MiningDashboard(App):
@@ -76,6 +121,12 @@ class MiningDashboard(App):
     #alert-log { height: 1fr; border: round $warning; }
     #detail-panel { height: 1fr; padding: 1; }
     #actions-log { height: 1fr; border: round $success; }
+
+    /* ── Sparkline rows in Miner Detail ── */
+    .spark-row { height: 2; padding: 0 1; }
+    .spark-label { width: 30; height: 2; content-align: left middle; }
+    .spark-graph { width: 1fr; height: 2; }
+    SparklineRow { height: auto; }
 
     /* ── Scenarios tab ── */
     #scenarios-panel { height: 1fr; padding: 1; }
@@ -139,12 +190,22 @@ class MiningDashboard(App):
                 with TabPane("Alerts", id="tab-alerts"):
                     yield RichLog(id="alert-log", highlight=True, max_lines=200, markup=True)
 
-                # Tab 3: Miner Detail
+                # Tab 3: Miner Detail (with live sparkline graphs)
                 with TabPane("Miner Detail", id="tab-detail"):
                     with VerticalScroll(id="detail-panel"):
                         yield Label("Select a miner from Fleet Overview (click a row)", id="detail-header")
                         yield Rule()
-                        yield Static(id="detail-content")
+                        yield Static(id="detail-info")
+                        yield Rule()
+                        yield Label("[bold underline]Live Telemetry[/]")
+                        for cfg in SPARKLINE_METRICS[:4]:
+                            yield SparklineRow(cfg[0], cfg[1], cfg[2], cfg[5], cfg[6])
+                        yield Rule()
+                        yield Label("[bold underline]AI Signals[/]")
+                        for cfg in SPARKLINE_METRICS[4:]:
+                            yield SparklineRow(cfg[0], cfg[1], cfg[2], cfg[5], cfg[6])
+                        yield Rule()
+                        yield Static(id="detail-ai-text")
 
                 # Tab 4: Optimizer Actions
                 with TabPane("Optimizer Actions", id="tab-actions"):
@@ -408,42 +469,104 @@ class MiningDashboard(App):
                 log.write(Text.from_markup(
                     f"  {ts}  [dim] ACT [/dim]  {mid}  {action.reason}\n"))
 
-    # ── Miner Detail (enhanced with AI score breakdown) ───────────
+    # ── Miner Detail (with live sparkline graphs + AI breakdown) ──
 
     def _update_detail(self) -> None:
-        miner = next((m for m in self.sim.miners if m.miner_id == self.selected_miner_id), None)
+        """
+        Update the Miner Detail tab with live sparklines and AI text.
+
+        The tab has three sections:
+          1. detail-info: operating mode, health %, uptime (text)
+          2. SparklineRows: 4 telemetry + 3 AI signal sparklines
+          3. detail-ai-text: XGBoost/LSTM scores, risk, features (text)
+
+        Sparklines update every tick (200 ms). The AI text block
+        updates every 5 ticks (1 second) because it calls
+        get_detailed_scores which is heavier.
+        """
+        miner = next(
+            (m for m in self.sim.miners if m.miner_id == self.selected_miner_id),
+            None,
+        )
         if not miner:
             return
-        try:
-            self.query_one("#detail-header", Label).update(
-                f"  {miner.miner_id} — {miner.spec.model} | {miner.container_id} Pos {miner.position}")
 
-            content = self.query_one("#detail-content", Static)
+        try:
+            # ── Header ──
+            self.query_one("#detail-header", Label).update(
+                f"  {miner.miner_id} — {miner.spec.model} | "
+                f"{miner.container_id} Pos {miner.position}"
+            )
+
+            # ── Info line ──
+            hc = (
+                "green" if miner.health_score > 0.8
+                else "yellow" if miner.health_score > 0.4
+                else "red"
+            )
+            try:
+                self.query_one("#detail-info", Static).update(
+                    f"[bold]Mode:[/] {miner.mode.value}  |  "
+                    f"[bold]Health:[/] [{hc}]{miner.health_score:.0%}[/]  |  "
+                    f"[bold]Uptime:[/] {miner.uptime_hours:.0f}h  |  "
+                    f"[bold]Freq:[/] {miner.frequency_mhz:.0f} MHz  |  "
+                    f"[bold]Voltage:[/] {miner.voltage_v:.3f} V"
+                )
+            except Exception:
+                pass
+
+            # ── Sparklines ──
+            buf = self.sim.ai.buffers.get(miner.miner_id)
+            for cfg in SPARKLINE_METRICS:
+                metric_id, label, unit, source_type, field_name, _, _ = cfg
+
+                # Extract data
+                if source_type == "buffer" and buf:
+                    arr = buf.get_ordered(field_name)
+                    data = arr[-SPARKLINE_WINDOW:].tolist()
+                elif source_type == "deque":
+                    raw = list(getattr(miner, field_name, []))
+                    data = raw[-SPARKLINE_WINDOW:]
+                elif source_type == "derived" and buf:
+                    pwr = buf.get_ordered("power_w")[-SPARKLINE_WINDOW:]
+                    hr = buf.get_ordered("hashrate_th")[-SPARKLINE_WINDOW:]
+                    hr_safe = np.maximum(hr, 0.001)
+                    data = (pwr / hr_safe).tolist()
+                else:
+                    data = [0.0, 0.0]
+
+                current = data[-1] if len(data) > 0 else 0.0
+
+                # Update label with current value
+                try:
+                    lbl = self.query_one(f"#spark-label-{metric_id}", Label)
+                    if unit:
+                        lbl.update(f"  {label}: {current:.1f} {unit}")
+                    else:
+                        lbl.update(f"  {label}: {current:.4f}")
+                except Exception:
+                    pass
+
+                # Update sparkline data
+                try:
+                    spark = self.query_one(f"#spark-{metric_id}", Sparkline)
+                    spark.data = data if len(data) > 1 else [0.0, 0.0]
+                except Exception:
+                    pass
+
+            # ── AI text block (every 5 ticks for performance) ──
+            if self.sim.step % 5 == 0:
+                self._update_ai_text(miner)
+
+        except Exception:
+            pass
+
+    def _update_ai_text(self, miner: MinerState) -> None:
+        """Update the AI predictions text block in the detail panel."""
+        try:
             L = []
 
-            hc = "green" if miner.health_score > 0.8 else "yellow" if miner.health_score > 0.4 else "red"
-            L.append(f"[bold]Operating Mode:[/] {miner.mode.value}")
-            L.append(f"[bold]Health Score:[/]   [{hc}]{miner.health_score:.0%}[/]")
-            L.append(f"[bold]Uptime:[/]         {miner.uptime_hours:.0f} hours")
-            L.append("")
-
-            L.append("[bold underline]Live Telemetry[/]")
-            L.append(f"  Frequency:     {miner.frequency_mhz:.0f} MHz  (range: {miner.spec.freq_min_mhz}-{miner.spec.freq_max_mhz})")
-            L.append(f"  Voltage:       {miner.voltage_v:.3f} V")
-            tc = "red" if miner.temperature_c > 90 else "yellow" if miner.temperature_c > 80 else "green"
-            L.append(f"  Temperature:   [{tc}]{miner.temperature_c:.1f} C[/]  (ambient: {miner.ambient_c:.1f} C)")
-            L.append(f"  Hashrate:      {miner.hashrate_th:.1f} TH/s  (nameplate: {miner.spec.hashrate_nameplate_th})")
-            L.append(f"  Power:         {miner.power_w:.0f} W")
-            L.append("")
-
-            L.append("[bold underline]KPIs[/]")
-            L.append(f"  Efficiency:    {miner.efficiency_jth:.1f} J/TH" if miner.efficiency_jth < 1000 else "  Efficiency:    N/A")
-            L.append(f"  TE Health:     {miner.te_health:.5f}")
-            L.append(f"  Realization:   {miner.hashrate_realization:.1%}")
-            L.append("")
-
-            # AI Score Breakdown (XGBoost + LSTM + Risk Level)
-            L.append("[bold underline]AI Predictions[/]")
+            # AI Score Breakdown
             scores = self.sim.ai.get_detailed_scores(miner.miner_id)
             xgb = scores.get("xgb_score", 0)
             lstm = scores.get("lstm_score", 0)
@@ -455,62 +578,41 @@ class MiningDashboard(App):
             lc = "red" if lstm > 0.5 else "yellow" if lstm > 0.2 else "green"
             cc = "red" if combined > 0.1 else "yellow" if combined > 0.01 else "green"
 
-            L.append(f"  XGBoost score:   [{xc}]{xgb:.4f}[/]")
-            L.append(f"  LSTM score:      [{lc}]{lstm:.4f}[/]")
-            L.append(f"  Combined score:  [{cc}]{combined:.4f}[/]")
-            L.append(f"  Sustained:       {sustained} min above threshold")
-            L.append("")
+            L.append("[bold underline]AI Predictions[/]")
+            L.append(f"  XGBoost:    [{xc}]{xgb:.4f}[/]")
+            L.append(f"  LSTM:       [{lc}]{lstm:.4f}[/]")
+            L.append(f"  Combined:   [{cc}]{combined:.4f}[/]")
+            L.append(f"  Sustained:  {sustained} min")
 
-            # Risk level display with source
-            ml_risk = scores.get("ml_risk", "LOW")
-            health_risk = scores.get("health_risk", "LOW")
-            risk_source = scores.get("risk_source", "")
-
+            # Risk level
             risk_colors = {"LOW": "green", "ELEVATED": "yellow", "HIGH": "red", "CRITICAL": "red bold"}
             risk_actions = {
-                "LOW": "Normal operation — no action needed",
-                "ELEVATED": "Worth watching — early signs of degradation",
-                "HIGH": "Schedule inspection — confirmed degradation",
-                "CRITICAL": "Immediate action — failure imminent or occurring",
+                "LOW": "Normal operation",
+                "ELEVATED": "Watch — early degradation signs",
+                "HIGH": "Inspect — confirmed degradation",
+                "CRITICAL": "Immediate action — failure imminent",
             }
             rc = risk_colors.get(risk, "white")
-            L.append(f"  Risk Level:      [{rc}]{risk}[/]")
-            L.append(f"  Action:          {risk_actions.get(risk, '')}")
+            L.append(f"  Risk:       [{rc}]{risk}[/] — {risk_actions.get(risk, '')}")
+            L.append(f"  Flagged:    {'[magenta]YES[/]' if miner.is_flagged else 'No'}")
             L.append("")
 
-            # Show what's driving the risk
-            L.append(f"  [dim]Risk breakdown:[/]")
-            mlc = risk_colors.get(ml_risk, "white")
-            hrc = risk_colors.get(health_risk, "white")
-            L.append(f"    AI models:     [{mlc}]{ml_risk}[/]  [dim](score {combined:.4f}, sustained {sustained} min)[/]")
-            L.append(f"    Health state:   [{hrc}]{health_risk}[/]  [dim](health {miner.health_score:.0%})[/]")
-            if risk_source == "health":
-                L.append(f"    [dim]Driven by: direct health measurement (not model prediction)[/]")
-            elif risk_source == "ai_model":
-                L.append(f"    [dim]Driven by: AI model detecting pattern before health drops[/]")
-            elif risk_source == "both":
-                L.append(f"    [dim]Driven by: both AI model and health agree[/]")
-            L.append(f"  Maint flagged:   {'[magenta]YES[/]' if miner.is_flagged else 'No'}")
-            L.append("")
-
-            # Top feature contributions
+            # Top features
             contribs = self.sim.ai.get_feature_contributions(miner.miner_id, top_n=5)
             if contribs:
-                L.append("[bold underline]Top Feature Contributions[/]")
+                L.append("[bold underline]Top Features[/]")
                 for feat, val in contribs:
                     short = feat.replace("_roll_", " ").replace("_", " ")
-                    L.append(f"  {short:35s} {val:>10.2f}")
+                    L.append(f"  {short:30s} {val:>8.2f}")
                 L.append("")
 
             # Failure ground truth
             if miner._scenario_name:
                 L.append("[bold underline]Scenario (Ground Truth)[/]")
-                L.append(f"  Type:     [red]{miner._scenario_name}[/]")
-                L.append(f"  Onset:    Step {miner._failure_onset_step}")
-                L.append(f"  Duration: {miner._failure_duration} steps")
-                L.append(f"  Progress: {miner.failure_progress:.0%}")
+                L.append(f"  Type: [red]{miner._scenario_name}[/]  "
+                         f"Progress: {miner.failure_progress:.0%}")
 
-            content.update("\n".join(L))
+            self.query_one("#detail-ai-text", Static).update("\n".join(L))
         except Exception:
             pass
 
