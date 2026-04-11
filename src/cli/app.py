@@ -62,16 +62,23 @@ class MetricCard(Static):
 
 SPARKLINE_WINDOW = 60  # last 60 simulated minutes shown in each sparkline
 
-# (metric_id, label, unit, data_source, field_name, min_color, max_color)
-# data_source: "buffer" = MinerBuffer ring, "deque" = MinerState deque, "derived" = computed
+# Each metric has fixed display bounds (y_min, y_max) so the graph
+# shows meaningful position within the operational range instead of
+# auto-scaling tiny healthy-state fluctuations into full-height bars.
+# Without fixed bounds, a healthy miner at 72±1°C produces a noisy
+# blocky graph that fills the whole height — useless. With bounds
+# of (20, 100) the same data renders as a calm line near the 72%
+# mark, and a thermal runaway climbs visibly toward the top.
+#
+# (metric_id, label, unit, source, field, min_color, max_color, y_min, y_max)
 SPARKLINE_METRICS = [
-    ("temp",       "Temperature",   "°C",   "buffer",  "temperature_c",          "#22cc22", "#ff4444"),
-    ("hashrate",   "Hashrate",      "TH/s", "buffer",  "hashrate_th",            "#2266ff", "#22ccff"),
-    ("power",      "Power",         "W",    "buffer",  "power_w",                "#ffaa00", "#ff4444"),
-    ("efficiency", "J/TH",          "J/TH", "derived", "efficiency_jth",         "#22cc22", "#ffaa00"),
-    ("te_health",  "TE Health",     "",     "deque",   "te_health_history",       "#22cc22", "#ff4444"),
-    ("anomaly",    "Anomaly Score", "",     "deque",   "anomaly_score_history",   "#22cc22", "#ff4444"),
-    ("health",     "Health Score",  "",     "deque",   "health_score_history",    "#ff4444", "#22cc22"),
+    ("temp",       "Temperature",   "°C",   "buffer",  "temperature_c",    "#22cc22", "#ff4444",  20.0, 100.0),
+    ("hashrate",   "Hashrate",      "TH/s", "buffer",  "hashrate_th",      "#2266ff", "#22ccff",   0.0, 400.0),
+    ("power",      "Power",         "W",    "buffer",  "power_w",          "#ffaa00", "#ff4444",   0.0, 8000.0),
+    ("efficiency", "J/TH",          "J/TH", "derived", "efficiency_jth",   "#22cc22", "#ffaa00",  10.0,  40.0),
+    ("te_health",  "TE Health",     "",     "deque",   "te_health_history", "#22cc22", "#ff4444",   0.0,   0.08),
+    ("anomaly",    "Anomaly Score", "",     "deque",   "anomaly_score_history", "#22cc22", "#ff4444", 0.0, 1.0),
+    ("health",     "Health Score",  "",     "deque",   "health_score_history",  "#ff4444", "#22cc22", 0.0, 1.0),
 ]
 
 
@@ -518,7 +525,8 @@ class MiningDashboard(App):
             # ── Sparklines ──
             buf = self.sim.ai.buffers.get(miner.miner_id)
             for cfg in SPARKLINE_METRICS:
-                metric_id, label, unit, source_type, field_name, _, _ = cfg
+                (metric_id, label, unit, source_type, field_name,
+                 _, _, y_min, y_max) = cfg
 
                 # Extract data
                 if source_type == "buffer" and buf:
@@ -536,6 +544,18 @@ class MiningDashboard(App):
                     data = [0.0, 0.0]
 
                 current = data[-1] if len(data) > 0 else 0.0
+
+                # Normalize data to fixed [y_min, y_max] range so the
+                # sparkline shows meaningful position within the
+                # operational range instead of auto-scaling noise.
+                # A healthy miner at 72°C renders near the 65% mark
+                # of a [20, 100] range; a thermal runaway at 95°C
+                # climbs visibly toward the top.
+                y_range = max(y_max - y_min, 1e-6)
+                data = [
+                    max(0.0, min(1.0, (v - y_min) / y_range))
+                    for v in data
+                ]
 
                 # Update label with current value
                 try:
