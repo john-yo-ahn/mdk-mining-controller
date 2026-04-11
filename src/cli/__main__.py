@@ -2,11 +2,18 @@
 Entry point for the MDK Mining Controller.
 
 Usage:
-    python -m src.cli                         # Dashboard (24 miners)
-    python -m src.cli --miners 50             # Custom fleet size
-    python -m src.cli scenarios               # List all failure scenarios
-    python -m src.cli scenarios --detail       # Show scenario details
-    python -m src.cli train                    # Run full training pipeline
+    mdk                        # Launch the live dashboard (24 miners)
+    mdk --miners 50            # Dashboard with a larger fleet
+    mdk train                  # Run full training pipeline (~50 min)
+    mdk validate               # Run validation suite (~10 min)
+    mdk check                  # Run consistency check (13 invariants)
+    mdk test-te                # Run TE formula unit tests
+    mdk test-lstm              # Run LSTM experiment harness (toy mode)
+    mdk scenarios              # List failure scenarios
+    mdk scenarios --detail     # Show full scenario specs
+
+All commands work with either `mdk <cmd>` (if installed via uv sync)
+or `uv run python -m src.cli <cmd>`.
 """
 
 import argparse
@@ -91,6 +98,24 @@ def cmd_validate(args):
     run_validate(tests)
 
 
+def cmd_check(args):
+    from scripts.consistency_check import main as run_check
+    sys.exit(run_check())
+
+
+def cmd_test_te(args):
+    from scripts.test_te_formula import main as run_te_tests
+    sys.exit(run_te_tests())
+
+
+def cmd_test_lstm(args):
+    from scripts.lstm_experiment_harness import run, MODES
+    import json
+    cfg = MODES[args.mode]
+    metrics = run(cfg)
+    print("\n" + json.dumps(metrics, indent=2, default=str))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MDK Mining Controller — AI-Driven Mining Optimization"
@@ -110,18 +135,34 @@ def main():
     subparsers.add_parser("train", help="Run training pipeline")
 
     # Subcommand: validate
-    val_parser = subparsers.add_parser("validate", help="Run model validation tests")
+    val_parser = subparsers.add_parser("validate", help="Run validation suite (~10 min)")
     val_parser.add_argument("--test", "-t", choices=["holdout", "race", "blind", "noise"],
                             help="Run a specific test (default: all)")
 
+    # Subcommand: check
+    subparsers.add_parser("check", help="Run 13-invariant consistency check (~10 min)")
+
+    # Subcommand: test-te
+    subparsers.add_parser("test-te", help="Run TE formula unit tests (10 tests)")
+
+    # Subcommand: test-lstm
+    lstm_parser = subparsers.add_parser("test-lstm", help="Run LSTM experiment harness")
+    lstm_parser.add_argument("--mode", "-m", choices=["toy", "fast", "full"], default="toy",
+                              help="toy (~45s) / fast (~3min) / full (~25min)")
+
     args = parser.parse_args()
 
-    if args.command == "scenarios":
-        cmd_scenarios(args)
-    elif args.command == "train":
-        cmd_train(args)
-    elif args.command == "validate":
-        cmd_validate(args)
+    commands = {
+        "scenarios": cmd_scenarios,
+        "train": cmd_train,
+        "validate": cmd_validate,
+        "check": cmd_check,
+        "test-te": cmd_test_te,
+        "test-lstm": cmd_test_lstm,
+    }
+
+    if args.command in commands:
+        commands[args.command](args)
     else:
         cmd_dashboard(args)
 
