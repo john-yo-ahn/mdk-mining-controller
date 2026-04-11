@@ -16,12 +16,12 @@ from textual.widgets import (
     RichLog,
     Rule,
     Select,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
 )
 from textual.binding import Binding
-from textual_plotext import PlotextPlot
 
 import numpy as np
 from rich.text import Text
@@ -58,9 +58,18 @@ class MetricCard(Static):
             pass
 
 
-# ─── Chart configuration ────────────────────────────────────────────
+# ─── Sparkline configuration ────────────────────────────────────────
 
-CHART_WINDOW = 120  # last 120 simulated minutes shown in each chart
+SPARK_WINDOW = 120  # last 120 simulated minutes
+
+# Only 3 metrics — the ones operators actually watch. Each gets a
+# tall (height 4) sparkline so the shape is readable, not noise.
+# (id, label, unit, source, field, y_min, y_max, color)
+SPARK_METRICS = [
+    ("temp",    "Temperature", "°C", "buffer", "temperature_c", 40.0, 100.0, "red"),
+    ("hash",    "Hashrate",  "TH/s", "buffer", "hashrate_th",    0.0, 400.0, "dodger_blue"),
+    ("anomaly", "Anomaly",      "",  "deque",  "anomaly_score_history", 0.0, 1.0, "green"),
+]
 
 
 # ─── Main Dashboard App ──────────────────────────────────────────────
@@ -84,8 +93,10 @@ class MiningDashboard(App):
     #detail-panel { height: 1fr; padding: 1; }
     #actions-log { height: 1fr; border: round $success; }
 
-    /* ── Plotext charts in Miner Detail ── */
-    .detail-chart { height: 16; margin: 0 1; }
+    /* ── Sparklines in Miner Detail ── */
+    .spark-section { padding: 0 1; }
+    .spark-header { height: 1; margin: 0 0; color: $text-muted; }
+    .detail-spark { height: 4; margin: 0 0; }
 
     /* ── Scenarios tab ── */
     #scenarios-panel { height: 1fr; padding: 1; }
@@ -149,14 +160,16 @@ class MiningDashboard(App):
                 with TabPane("Alerts", id="tab-alerts"):
                     yield RichLog(id="alert-log", highlight=True, max_lines=200, markup=True)
 
-                # Tab 3: Miner Detail (with plotext line charts)
+                # Tab 3: Miner Detail (3 tall sparklines + AI text)
                 with TabPane("Miner Detail", id="tab-detail"):
                     with VerticalScroll(id="detail-panel"):
                         yield Label("Select a miner from Fleet Overview (click a row)", id="detail-header")
                         yield Rule()
                         yield Static(id="detail-info")
-                        yield PlotextPlot(id="chart-telemetry", classes="detail-chart")
-                        yield PlotextPlot(id="chart-ai", classes="detail-chart")
+                        yield Rule()
+                        for cfg in SPARK_METRICS:
+                            yield Label(f"  {cfg[1]}: --", id=f"spark-lbl-{cfg[0]}", classes="spark-header")
+                            yield Sparkline(data=[0.0, 0.0], id=f"spark-{cfg[0]}", classes="detail-spark")
                         yield Rule()
                         yield Static(id="detail-ai-text")
 
@@ -445,20 +458,9 @@ class MiningDashboard(App):
                 log.write(Text.from_markup(
                     f"  {ts}  [dim] ACT [/dim]  {mid}  {action.reason}\n"))
 
-    # ── Miner Detail (with plotext line charts + AI breakdown) ──
+    # ── Miner Detail (3 tall sparklines + AI text) ────────────────
 
     def _update_detail(self) -> None:
-        """
-        Update the Miner Detail tab with plotext charts and AI text.
-
-        Two charts:
-          1. Telemetry: temperature + hashrate + power + J/TH
-          2. AI signals: anomaly score + health score + TE health
-
-        Charts update every 3 ticks (~600ms) for smooth animation
-        without excessive rendering overhead. The AI text block
-        updates every 5 ticks.
-        """
         miner = next(
             (m for m in self.sim.miners if m.miner_id == self.selected_miner_id),
             None,
@@ -467,108 +469,61 @@ class MiningDashboard(App):
             return
 
         try:
-            # ── Header ──
             self.query_one("#detail-header", Label).update(
                 f"  {miner.miner_id} — {miner.spec.model} | "
                 f"{miner.container_id} Pos {miner.position}"
             )
 
-            # ── Info line ──
             hc = (
                 "green" if miner.health_score > 0.8
                 else "yellow" if miner.health_score > 0.4
                 else "red"
             )
+            self.query_one("#detail-info", Static).update(
+                f"[bold]Mode:[/] {miner.mode.value}  |  "
+                f"[bold]Health:[/] [{hc}]{miner.health_score:.0%}[/]  |  "
+                f"[bold]Uptime:[/] {miner.uptime_hours:.0f}h  |  "
+                f"[bold]Freq:[/] {miner.frequency_mhz:.0f} MHz  |  "
+                f"[bold]Voltage:[/] {miner.voltage_v:.3f} V  |  "
+                f"[bold]TE:[/] {miner.te_health:.4f}  |  "
+                f"[bold]J/TH:[/] {miner.efficiency_jth:.1f}" if miner.efficiency_jth < 1000 else
+                f"[bold]Mode:[/] {miner.mode.value}  |  "
+                f"[bold]Health:[/] [{hc}]{miner.health_score:.0%}[/]  |  "
+                f"[bold]Uptime:[/] {miner.uptime_hours:.0f}h"
+            )
+        except Exception:
+            pass
+
+        # ── Sparklines — every tick, near-zero cost ──
+        buf = self.sim.ai.buffers.get(miner.miner_id)
+        for cfg in SPARK_METRICS:
+            mid, label, unit, source, field, y_min, y_max, _ = cfg
             try:
-                self.query_one("#detail-info", Static).update(
-                    f"[bold]Mode:[/] {miner.mode.value}  |  "
-                    f"[bold]Health:[/] [{hc}]{miner.health_score:.0%}[/]  |  "
-                    f"[bold]Uptime:[/] {miner.uptime_hours:.0f}h  |  "
-                    f"[bold]Freq:[/] {miner.frequency_mhz:.0f} MHz  |  "
-                    f"[bold]Voltage:[/] {miner.voltage_v:.3f} V"
+                if source == "buffer" and buf:
+                    raw = buf.get_ordered(field)[-SPARK_WINDOW:]
+                    data = raw.tolist()
+                elif source == "deque":
+                    data = list(getattr(miner, field, []))[-SPARK_WINDOW:]
+                else:
+                    data = [0.0, 0.0]
+
+                current = data[-1] if data else 0.0
+
+                # Normalize to fixed y-range
+                y_range = max(y_max - y_min, 1e-6)
+                normed = [max(0.0, min(1.0, (v - y_min) / y_range)) for v in data]
+
+                self.query_one(f"#spark-lbl-{mid}", Label).update(
+                    f"  {label}: {current:.1f} {unit}" if unit else f"  {label}: {current:.4f}"
                 )
+                spark = self.query_one(f"#spark-{mid}", Sparkline)
+                spark.data = normed if len(normed) > 1 else [0.0, 0.0]
             except Exception:
                 pass
 
-            # ── Charts (every 10 ticks = 2 seconds) ──
-            # Plotext rasterizes the full chart to Unicode on every
-            # refresh (~50ms per chart). At 5Hz tick rate that would
-            # consume 500ms/sec of the render budget on charts alone.
-            # 2-second updates are visually smooth for trend data and
-            # keep the per-tick cost under 20ms.
-            if self.sim.step % 10 == 0:
-                self._update_charts(miner)
-
-            # ── AI text block (every 5 ticks) ──
-            if self.sim.step % 5 == 0:
-                self._update_ai_text(miner)
-
-        except Exception:
-            pass
-
-    def _update_charts(self, miner: MinerState) -> None:
-        """Render plotext line charts for telemetry and AI signals."""
-        buf = self.sim.ai.buffers.get(miner.miner_id)
-        if not buf or buf.length < 2:
-            return
-
-        W = CHART_WINDOW
-
-        # ── Extract telemetry data ──
-        temp = buf.get_ordered("temperature_c")[-W:]
-        hr = buf.get_ordered("hashrate_th")[-W:]
-        pwr = buf.get_ordered("power_w")[-W:]
-        hr_safe = np.maximum(hr, 0.001)
-        jth = (pwr / hr_safe)
-        x = list(range(len(temp)))
-
-        # ── Chart 1: Telemetry ──
-        try:
-            chart_widget = self.query_one("#chart-telemetry", PlotextPlot)
-            plt = chart_widget.plt
-            plt.clear_figure()
-            plt.theme("dark")
-            plt.title("Live Telemetry (last 2 hours)")
-            plt.xlabel("minutes ago")
-
-            plt.plot(x, temp.tolist(), label=f"Temp {temp[-1]:.0f}°C", color="red")
-            plt.plot(x, hr.tolist(), label=f"Hash {hr[-1]:.0f} TH/s", color="cyan")
-            plt.plot(x, (pwr / 100).tolist(), label=f"Power {pwr[-1]:.0f}W (÷100)", color="yellow")
-            plt.plot(x, jth.tolist(), label=f"J/TH {jth[-1]:.1f}", color="green")
-
-            plt.ylim(0, max(float(temp.max()), float(hr.max()), 100) * 1.15)
-            chart_widget.refresh()
-        except Exception:
-            pass
-
-        # ── Chart 2: AI Signals ──
-        te_hist = list(miner.te_health_history)[-W:]
-        anom_hist = list(miner.anomaly_score_history)[-W:]
-        health_hist = list(miner.health_score_history)[-W:]
-
-        if len(te_hist) < 2:
-            return
-
-        x2 = list(range(len(health_hist)))
-
-        try:
-            chart_widget2 = self.query_one("#chart-ai", PlotextPlot)
-            plt2 = chart_widget2.plt
-            plt2.clear_figure()
-            plt2.theme("dark")
-            plt2.title("AI Signals (last 2 hours)")
-            plt2.xlabel("minutes ago")
-
-            plt2.plot(x2, health_hist, label=f"Health {health_hist[-1]:.2f}", color="green")
-            plt2.plot(x2, anom_hist, label=f"Anomaly {anom_hist[-1]:.3f}", color="red")
-            # TE health is ~0.05 scale, multiply by 10 to make visible alongside 0-1 signals
-            te_scaled = [v * 10 for v in te_hist]
-            plt2.plot(x2[:len(te_scaled)], te_scaled, label=f"TE×10 {te_hist[-1]:.4f}", color="cyan")
-
-            plt2.ylim(0, 1.1)
-            chart_widget2.refresh()
-        except Exception:
-            pass
+        # ── AI text (every 5 ticks) ──
+        if self.sim.step % 5 == 0:
+            self._update_ai_text(miner)
 
     def _update_ai_text(self, miner: MinerState) -> None:
         """Update the AI predictions text block in the detail panel."""
