@@ -238,7 +238,7 @@ class MiningDashboard(App):
         lib.update("\n".join(lines))
 
         # Start sim
-        self._tick_timer = self.set_interval(0.3, self._sim_tick)
+        self._tick_timer = self.set_interval(0.5, self._sim_tick)
 
     # ── Tick ──────────────────────────────────────────────────────
 

@@ -437,14 +437,26 @@ class MiningFleetSimulation:
                 miner.temperature_c, miner.power_w, miner.ambient_c,
             )
 
-            # AI predictions — run every 30 ticks (6 seconds sim time)
-            # to avoid calling the full 175-feature pipeline (preprocess
-            # → TE → build_feature_matrix on 10k-row buffer) for every
-            # miner every 200ms tick. That was the #1 performance
-            # bottleneck — 24 miners × full feature build × 5Hz = the
-            # entire CPU budget consumed by inference alone.
-            # Between prediction ticks, scores hold their last value.
-            if self.step % 30 == 0:
+            # AI predictions — staggered: ONE miner per tick.
+            #
+            # build_feature_matrix costs ~250ms per miner regardless
+            # of buffer size (fixed overhead of rolling windows,
+            # correlations, trends across 175 columns). Running all
+            # 24 at once freezes the UI for 8 seconds. Staggering
+            # means each tick spends ~250ms on ONE miner's prediction
+            # and ~1ms on physics for the other 23.
+            #
+            # At 500ms tick interval, the ~250ms prediction leaves
+            # ~250ms for Textual rendering — enough for smooth UI.
+            # Each miner gets predicted once every n_miners ticks
+            # (~12 seconds at 500ms × 24 miners). Between predictions,
+            # scores hold their last value.
+            #
+            # Skip shutdown miners entirely — they have no useful
+            # telemetry to predict on and waste the 250ms budget.
+            if miner.mode == OperatingMode.SHUTDOWN:
+                pass  # no prediction needed
+            elif self.miners.index(miner) == (self.step % len(self.miners)):
                 if self._ai_ready:
                     miner.anomaly_score, miner.predicted_failure = self.ai.predict(
                         miner.miner_id, health_score=miner.health_score,
