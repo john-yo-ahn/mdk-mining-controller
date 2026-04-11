@@ -662,6 +662,13 @@ class MiningDashboard(App):
 
     # ── Key actions ───────────────────────────────────────────────
 
+    def action_quit(self) -> None:
+        """Clean shutdown — close DuckDB before Textual tears down."""
+        if self._tick_timer:
+            self._tick_timer.stop()
+        self.sim.ai.close()
+        self.exit()
+
     def action_toggle_pause(self) -> None:
         self.paused = not self.paused
 
