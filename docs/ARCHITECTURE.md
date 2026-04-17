@@ -9,7 +9,7 @@ referenced under each section.
 ```mermaid
 flowchart TB
     subgraph Gen ["Synthetic data generation"]
-        SCEN[Scenario library<br/>7 failure types] --> GEN[MiningDataGenerator<br/>physics-first]
+        SCEN[Scenario library<br/>8 failure types] --> GEN[MiningDataGenerator<br/>physics-first]
         PHYS[Physics models<br/>P=CV²f, RC thermal] --> GEN
         SPECS[Hardware specs<br/>4 ASIC models] --> GEN
         GEN --> RAW[(raw/mining_telemetry.parquet<br/>5.2M rows)]
@@ -19,8 +19,8 @@ flowchart TB
         RAW --> ING[ingestion.py<br/>load + schema check]
         ING --> PRE[preprocessing.py<br/>clean, fillna, normalize]
         PRE --> KPI[true_efficiency.py<br/>TE base/adjusted/health]
-        KPI --> FEAT[features.py<br/>152-feature builder]
-        FEAT --> CACHE[(processed/features.v2.parquet)]
+        KPI --> FEAT[features.py<br/>175-feature builder]
+        FEAT --> CACHE[(processed/features.v3.parquet)]
     end
 
     subgraph Split ["Train/val/test split"]
@@ -153,7 +153,7 @@ top-level emergency hook even when no AI prediction is involved.
 | End-to-end training pipeline | `src/run_pipeline.py` |
 | Synthetic data generation | `src/synthetic/generator.py` |
 | Failure scenario library | `src/synthetic/scenarios.py` |
-| Feature engineering (152 cols) | `src/pipeline/features.py` |
+| Feature engineering (175 cols) | `src/pipeline/features.py` |
 | Adaptive temporal split | `src/pipeline/features.py:split_temporal_tvt` |
 | True Efficiency KPI | `src/kpi/true_efficiency.py` |
 | XGBoost classifier | `src/models/xgboost_classifier.py` |
@@ -170,7 +170,7 @@ top-level emergency hook even when no AI prediction is involved.
 ## Performance characteristics
 
 Measured on Apple Silicon M-series at the 30 × 120 scale (5.2 M rows,
-152 features, 16 failing miners):
+175 features, 16 failing miners):
 
 | Step | Wall clock |
 |---|---|

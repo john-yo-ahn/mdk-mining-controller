@@ -6,7 +6,7 @@ This is the rubric-sized brief. Deep dives, postmortems, and receipts live in th
 
 ## Problem
 
-Bitcoin mining profitability is a cost-management game: hash price is set by the market, so operators can only control chip efficiency and unplanned downtime. The MDK platform exposes low-level telemetry and control interfaces, but extracting value requires a controller that (a) detects pre-failure degradation days ahead and (b) adapts miner settings to changing thermal and economic conditions. This prototype delivers both, validated on a physics-plausible synthetic dataset of 30 miners across 120 days (5.2 M rows).
+Bitcoin mining profitability is a cost-management game: hash price is set by the market, so operators can only control chip efficiency and unplanned downtime. The **Mining Development Kit (MDK)** platform exposes low-level telemetry and control interfaces (frequency, voltage, hashrate, temperature, power), but extracting value requires a controller that (a) detects pre-failure degradation days ahead and (b) adapts miner settings to changing thermal and economic conditions. This prototype delivers both, validated on a physics-plausible synthetic dataset of 30 miners across 120 days (5.2 M rows).
 
 ## Approach
 
@@ -16,6 +16,8 @@ Two models run in parallel, each compensating for the other's blind spots:
 - **LSTM-Autoencoder** (unsupervised, trained on healthy telemetry only) — flags anything deviating from the healthy manifold, regardless of failure type. Fills XGBoost's coverage gap on `psu_degradation` and `coolant_restriction`.
 
 Both feed a **rule-based optimizer** (reacting to thermal state, energy price, and AI-predicted risk) whose every action passes through a `SafetyGuard` with thermal, rate, and value-bound clamps. Rules were chosen over RL deliberately: rules are auditable, every action is gated, and the failure mode of a bug is "no action" — never "unsafe action."
+
+*Put plainly: XGBoost learns patterns from known failures; LSTM-AE learns "what healthy looks like" and flags anything else. The rule optimizer adjusts miner settings only when safe.*
 
 ## KPI — True Efficiency (§3.1.b compliance)
 
@@ -61,7 +63,7 @@ End-to-end dataflow: **Hardware → Telemetry Pipeline → Feature Processing �
 
 | Metric | Value |
 |---|---|
-| XGBoost AUC / F1 | **0.851** / 0.217 |
+| XGBoost AUC / F1 | **0.851** / 0.217 *(F1 low because only 7 % of rows are pre-failure — see below)* |
 | XGBoost catches | **4 of 6** failures, avg **271 h (≈11 days)** lead time |
 | LSTM-AE separation (alive failures) | **5.70×** (healthy FAR 10%) |
 | Combined coverage | **7 of 8** measurable failures caught by ≥1 model |
@@ -82,7 +84,7 @@ Thresholds are calibrated on validation, never on the test set.
 
 - **Generalization to unseen failure types is weak** — `mdk validate` hold-out catches 1/3 unseen types. Consistent with a supervised learner asked to extrapolate, and the explicit motivation for running LSTM-AE alongside (it flags 73 % of `connector_corrosion` sequences XGBoost misses).
 - **Synthetic dataset**, not real MDK telemetry. Pipeline architected for a swap-in `MDKClient` adapter (gated on Tether data access — `F14`).
-- **Live dashboard** was recently hardened against four silent-failure bugs (full-report §6.3); `mdk test-cli` regression suite keeps them fixed.
+- **Live dashboard** was recently hardened — end-to-end testing (§6.3 of full report) uncovered four silent UI bugs where the fleet table stopped updating, scenarios leaked between miners, and speed controls were inverted. All four have regression tests (`mdk test-cli`, 4/4 passing).
 
 ## Reproducibility
 
