@@ -8,7 +8,7 @@ import collections
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional, List, Dict
 
@@ -215,7 +215,7 @@ class MiningFleetSimulation:
 
         for i in range(self.n_miners):
             model_name = models[i % len(models)]
-            spec = MINER_MODELS[model_name]
+            spec = replace(MINER_MODELS[model_name])  # per-miner copy; scenarios mutate spec
             container = containers[i % len(containers)]
 
             miner = MinerState(
