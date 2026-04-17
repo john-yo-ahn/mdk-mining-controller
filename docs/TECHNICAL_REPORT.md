@@ -7,6 +7,32 @@
 
 ---
 
+## Executive Summary
+
+**Problem.** Bitcoin mining profitability is a cost-management game — operators control chip efficiency and unplanned downtime, not hash price. This prototype delivers an AI-driven controller for Tether's MDK platform addressing both levers: predictive maintenance (lead-time alerts on hardware degradation) and dynamic efficiency optimization (rule-based frequency control gated by safety bounds).
+
+**Approach.** Two models run in parallel. **XGBoost** (supervised, 175 engineered features) classifies pre-failure windows on the failure types it has seen. **LSTM-Autoencoder** (unsupervised, trained only on healthy telemetry) flags anything outside the healthy manifold — catching the two failure types XGBoost is blind to. Both feed a rule-based optimizer whose every action passes through a `SafetyGuard` with thermal, rate, and value-bound clamps.
+
+**KPI.** The True Efficiency (TE) KPI (§4) layers three formulas that together incorporate all four §3.1.b rubric variables: cooling overhead, chip voltage, ambient temperature, and operating mode. TE's rolling variants rank 8 and 9 in XGBoost feature importance — the model materially relies on them.
+
+**Headline results** (held-out test set, 120-day synthetic fleet of 30 miners):
+
+| Metric | Value |
+|---|---|
+| XGBoost AUC / F1 | **0.851** / 0.217 |
+| XGBoost catches | **4 of 6** measurable failures, avg **271 h (≈11 days)** lead time |
+| LSTM-AE separation (alive failures) | **5.70×** (healthy FAR 10%) |
+| Combined coverage | **7 of 8** measurable failures caught by at least one model |
+| Failure types with no model signal | 1 (`sudden_chip_failure` — handled reactively by `SafetyGuard`) |
+
+**Safety.** Three defense layers: hard thermal/rate/value clamps in `SafetyGuard`, two-model redundancy (neither alone covers the fleet), and fully interpretable ML (XGBoost feature importance + LSTM-AE per-sample reconstruction error). Threshold calibration never touches the test set.
+
+**Honest limitations.** Generalization to **unseen** failure types is weak (1 of 3 on the `mdk validate` hold-out) — a known supervised-learner property and the explicit motivation for running the LSTM-AE alongside. The CLI dashboard was recently hardened against four silent-failure bugs (§6.3); `mdk test-cli` keeps them fixed. The synthetic dataset is physics-plausible but not real MDK telemetry (gated on Tether data access, `F14`).
+
+**Reproducibility.** Every result in this report is reproducible via `uv run mdk check` (13 invariants, ~11 min) and `uv run mdk validate` (4 end-to-end tests, ~9 min). See Appendix.
+
+---
+
 ## 1. Problem Statement
 
 Bitcoin mining is a cost-management game. Hashprice is determined by the
@@ -126,27 +152,60 @@ migration path is documented in `docs/PROPOSAL.md` as stretch work.
 
 ## 3. Pipeline Architecture
 
-```
-Synthetic       Feature         Train/Val/Test       Supervised + Unsupervised
-Telemetry  →    Engineering →   Temporal Split   →   Models (XGBoost + LSTM-AE)
-(5.2 M rows)    (152 features)  (adaptive)           ↓
-                                                     Threshold tuning on VAL only
-                                                     ↓
-                                                     Held-out TEST evaluation
-                                                     (honest metrics)
-                                                     ↓
-                                                     Combined risk score
-                                                     ↓
-                                                     Rule-based optimizer
-                                                     ↓
-                                                     SafetyGuard (hard limits)
-                                                     ↓
-                                                     Control actions
+```mermaid
+flowchart TB
+    subgraph Gen ["Synthetic data generation"]
+        SCEN[Scenario library<br/>8 failure types] --> GEN[MiningDataGenerator<br/>physics-first]
+        PHYS[Physics models<br/>P=CV²f, RC thermal] --> GEN
+        SPECS[Hardware specs<br/>4 ASIC models] --> GEN
+        GEN --> RAW[(raw/mining_telemetry.parquet<br/>5.2M rows)]
+    end
+
+    subgraph Pipe ["Data pipeline"]
+        RAW --> ING[ingestion.py<br/>load + schema check]
+        ING --> PRE[preprocessing.py<br/>clean, fillna, normalize]
+        PRE --> KPI[true_efficiency.py<br/>TE base/adjusted/health]
+        KPI --> FEAT[features.py<br/>175-feature builder]
+        FEAT --> CACHE[(processed/features.v3.parquet)]
+    end
+
+    subgraph Split ["Train/val/test split"]
+        CACHE --> SPLIT[split_temporal_tvt<br/>adaptive by positives]
+        SPLIT --> TRAIN[Train 55% of positives]
+        SPLIT --> VAL[Val 15% of positives]
+        SPLIT --> TEST[Test 30% of positives]
+    end
+
+    subgraph Train ["Model training"]
+        TRAIN --> XGB[XGBoost classifier<br/>tree_method=hist]
+        TRAIN --> LSTM[LSTM-Autoencoder<br/>healthy-only, MPS]
+        VAL --> XGB
+        VAL --> LSTM
+    end
+
+    subgraph Eval ["Honest evaluation"]
+        XGB --> XGBSAVE[(models/xgboost_failure.joblib)]
+        LSTM --> LSTMSAVE[(models/lstm_ae.pt<br/>+ persistent scaler)]
+        TEST --> METRICS[evaluation.py<br/>AUC, F1, detection timeline]
+        XGBSAVE --> METRICS
+        LSTMSAVE --> METRICS
+    end
+
+    subgraph Live ["Live inference (CLI)"]
+        SIM[MiningFleetSimulation<br/>30 miners, 1 tick = 1 min] --> BUF[MinerBuffer<br/>rolling 120-row ring]
+        BUF --> AIBR[AIBridge<br/>load + predict]
+        XGBSAVE -.load.-> AIBR
+        LSTMSAVE -.load.-> AIBR
+        AIBR --> RISK[Risk-level escalation<br/>LOW/ELEVATED/HIGH/CRITICAL]
+        RISK --> OPT[RuleBasedOptimizer<br/>thermal + price + degradation]
+        OPT --> SAFE[SafetyGuard<br/>thermal/rate/value bounds]
+        SAFE --> DASH[Textual Dashboard<br/>cli/app.py]
+    end
+
+    Eval -.models flow to live.-> Live
 ```
 
-Full component map is in `docs/ARCHITECTURE.md` with three mermaid
-diagrams covering dataflow, two-model rationale, and the safety
-control loop.
+This diagram is the **canonical architecture view** for this report. Two more diagrams (two-model rationale, safety control loop) and the per-file component map live in `docs/ARCHITECTURE.md`.
 
 ### 3.1 Notable engineering decisions
 
