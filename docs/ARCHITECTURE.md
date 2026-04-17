@@ -197,3 +197,34 @@ is regenerated or when `FEATURES_VERSION` is bumped.
 - Not an RL controller. The optimizer is intentionally rule-based for
   safety and auditability. Migration path to learned policies is
   documented in `docs/PROPOSAL.md`.
+
+## Testing surface
+
+Four orthogonal test surfaces cover the system:
+
+```mermaid
+flowchart LR
+    PIPE[src/] --> TE[mdk test-te<br/>10 KPI unit tests]
+    PIPE --> CLI[mdk test-cli<br/>4 dashboard regressions]
+    PIPE --> CHK[mdk check<br/>13 pipeline invariants]
+    PIPE --> VAL[mdk validate<br/>4 end-to-end tests]
+    TE -->|fast, ~2s| OK[green pipeline]
+    CLI -->|fast, ~15s| OK
+    CHK -->|slow, ~11 min| OK
+    VAL -->|slow, ~9 min| OK
+```
+
+- `mdk test-te` — TE formula math (10 assertions in
+  `scripts/test_te_formula.py`).
+- `mdk test-cli` — live dashboard regression suite
+  (`scripts/test_cli_dashboard_flaws.py`), covers the 4 flaws
+  found during end-to-end testing.
+- `mdk check` — 13-invariant batch-pipeline consistency
+  (`scripts/consistency_check.py`): module imports, feature
+  cache shape, model reload, temporal-split determinism, live
+  feature parity.
+- `mdk validate` — holdout / race / blind-injection / noise
+  (`src/validate.py`).
+
+Invoke either via `uv run mdk <cmd>` (if installed via `uv sync`)
+or via `uv run python -m src.cli <cmd>`.
