@@ -62,6 +62,10 @@ class MetricCard(Static):
 
 SPARK_WINDOW = 120  # last 120 simulated minutes
 
+# Single source of truth for tick pacing. sim_speed=1.0 → one tick per
+# BASE_TICK_INTERVAL seconds; speed_up halves the wait, speed_down doubles it.
+BASE_TICK_INTERVAL = 0.5
+
 # Only 3 metrics — the ones operators actually watch. Each gets a
 # tall (height 4) sparkline so the shape is readable, not noise.
 # (id, label, unit, source, field, y_min, y_max, color)
@@ -239,7 +243,7 @@ class MiningDashboard(App):
         lib.update("\n".join(lines))
 
         # Start sim
-        self._tick_timer = self.set_interval(0.5, self._sim_tick)
+        self._tick_timer = self.set_interval(BASE_TICK_INTERVAL / self.sim_speed, self._sim_tick)
 
     # ── Tick ──────────────────────────────────────────────────────
 
@@ -677,13 +681,17 @@ class MiningDashboard(App):
         if self._tick_timer:
             self._tick_timer.stop()
         self.sim_speed = min(10.0, self.sim_speed + 0.5)
-        self._tick_timer = self.set_interval(max(0.05, 0.2 / self.sim_speed), self._sim_tick)
+        self._tick_timer = self.set_interval(
+            max(0.05, BASE_TICK_INTERVAL / self.sim_speed), self._sim_tick
+        )
 
     def action_speed_down(self) -> None:
         if self._tick_timer:
             self._tick_timer.stop()
         self.sim_speed = max(0.5, self.sim_speed - 0.5)
-        self._tick_timer = self.set_interval(0.2 / self.sim_speed, self._sim_tick)
+        self._tick_timer = self.set_interval(
+            BASE_TICK_INTERVAL / self.sim_speed, self._sim_tick
+        )
 
     def action_focus_fleet(self) -> None:
         self.query_one(TabbedContent).active = "tab-fleet"
