@@ -473,3 +473,56 @@ If I were picking from this list with a finite time budget:
 
 Total: ~6 hours. Skips F2/F3/F6/F7/F9/F12/F13/F14, all of which are
 either nice-to-have or out of scope for the assignment timeline.
+
+### F15. Narrow remaining broad-except blocks in `src/cli/`
+
+**Priority:** P2 (post-submission hardening)
+**Effort:** 1-2 hours
+**Files:** `src/cli/app.py` (~8 blocks: `_update_kpis`, `_update_alerts`, `_update_detail`, `_update_actions`, `_update_scenarios`, `on_button_pressed`, `_update_status_bar`, `_update_ai_text`; plus nested `try/except Exception` inside `on_button_pressed` around L636-639), `src/cli/ai_bridge.py` (~7 blocks, including the unlogged `except Exception: pass` around L605).
+
+**What:** Narrow each `except Exception:` to the specific expected exception type (commonly `NoMatches`, `CellDoesNotExist`, `QueryError`, `DuckDBPyConnection` I/O errors). Any remaining catch-alls should at minimum log to a debug file.
+
+**Why:** This is the same class of bug as Flaw 4 in `mdk test-cli` — a broad catch-all silently swallowed a `CellDoesNotExist` that masked the fleet table never updating. The 15 remaining blocks are latent copies of that pattern.
+
+**Verification:** add a `scripts/test_cli_exception_narrowness.py` that monkey-patches each target method's inner call to raise an unexpected `AttributeError` and asserts propagation. Same pattern as `test_flaw4_fleet_update_raises_not_swallowed`.
+
+### F16. Decouple DataTable column display labels from update-cell keys
+
+**Priority:** P3 (nice-to-have)
+**Effort:** 30-60 min
+**Files:** `src/cli/app.py` (`_FLEET_COLUMNS` constant + `on_mount` and `_update_fleet_table`).
+
+**What:** Replace the pattern
+
+```python
+for label in ("ID", "Mode", ...):
+    table.add_column(label, key=label)
+# and in _update_fleet_table:
+table.update_cell(miner.miner_id, "Mode", miner.mode.value)
+```
+
+with stable short keys, e.g.
+
+```python
+_FLEET_COLUMNS = [("id", "ID"), ("mode", "Mode"), ...]
+for key, label in _FLEET_COLUMNS:
+    table.add_column(label, key=key)
+# and:
+table.update_cell(miner.miner_id, "mode", miner.mode.value)
+```
+
+**Why:** Today the column key IS the display label. Renaming "Temp (C)" → "Temp °C" silently breaks every `update_cell` call. The short-key variant decouples them — safe to rename display labels without breaking code.
+
+**Verification:** unit test that programmatically renames one column label and asserts updates still work. Fold into the existing `test_cli_dashboard_flaws.py` harness.
+
+### F17. Eliminate pandas `DataFrame is highly fragmented` PerformanceWarnings
+
+**Priority:** P3 (performance polish)
+**Effort:** 1-2 hours
+**Files:** `src/pipeline/features.py:113` — the repeated `df[name] = col.values` inside the rolling/trend/correlation loops.
+
+**What:** Refactor the feature builder to batch new columns via a `pd.concat([df, new_cols_df], axis=1)` at the end of each phase (ratios, rolling, trends, correlations, etc.) rather than assigning them one at a time. The warning fires ~25 times per `mdk check` run and obscures real warnings in logs.
+
+**Why:** Performance warning is cosmetic but noisy. A `pd.concat`-based rewrite also reduces memory fragmentation on the 5.2M-row feature matrix build.
+
+**Verification:** before → `mdk check 2>&1 | grep -c "highly fragmented"` returns some positive number. After → returns 0. Build time should not regress (measure with the same `mdk check` wall-clock; currently ~650s).
