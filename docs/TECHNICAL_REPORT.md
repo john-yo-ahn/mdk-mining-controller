@@ -309,6 +309,15 @@ validation decision.
 | Detection timeline | **4 of 6** | 3 of 6 |
 | Average lead time on catches | **271.2 hours ≈ 11.3 days** | 182.6h (7.6 days) |
 
+The AUC/F1 gap (0.851 vs 0.217) is driven by class imbalance — the
+pre-failure positive class is 4.71% of the training set and 7.40%
+of the test set (check #6). At that skew, threshold-dependent
+metrics like F1 are dominated by precision-recall tradeoffs; the
+threshold-independent AUC is the more honest summary of ranking
+quality. `scale_pos_weight` is sqrt-capped to 4.5 (from the raw
+20.2) to avoid over-predicting the positive class and flooding
+operators with false alarms.
+
 The jump from v2 to v3 (AUC +0.050, F1 +33%, Recall +60%,
 detection 3/6 → 4/6, lead time 7.6d → 11.3d) is attributable
 to the TE remediation: the `te_health` KPI got promoted from a
@@ -511,9 +520,18 @@ rolling features are 7-day windows, which means a 14-day dataset
 only has ~7 days of fully-populated features.** On such short
 datasets, the model is extremely conservative and recall collapses:
 
-- **Hold-out**: 1 of 3 unseen failure types detected (max score on
-  unseen `connector_corrosion` was 0.0003 — the model had never
-  seen the pattern and produced almost no signal)
+- **Hold-out**: 1 of 3 unseen failure types detected. Trained on
+  `gradual_degradation`, `thermal_runaway`, `fan_stall`,
+  `psu_degradation`, `sudden_chip_failure`; tested on
+  `coolant_restriction`, `firmware_oscillation`, `connector_corrosion`
+  (never seen). Only `coolant_restriction` produced a detection
+  signal — the model had almost no generalization to
+  `firmware_oscillation` or `connector_corrosion`, consistent with
+  a supervised classifier being asked to extrapolate outside its
+  training distribution. The LSTM-AE autoencoder mitigates this
+  gap in live deployment (see §5.3), where it flags 73.3 % of
+  `connector_corrosion` sequences that XGBoost's hold-out pass
+  missed.
 - **AI-vs-threshold (short window)**: 0 clear AI wins; both AI and
   threshold missed 9 of 10 cases because 14 days isn't enough
   runway for degradation signatures to develop or for 7-day rolling
@@ -627,15 +645,49 @@ designed around this asymmetry.
 | Bugs in rule-based optimizer | Lower risk than bugs in an RL policy because rules are auditable and every action goes through SafetyGuard. |
 | `sudden_chip_failure` slipping through predictive layer | Intentionally handled by reactive thermal shutdown instead. |
 
-### 6.3 Live inference limitations (documented honestly)
+### 6.3 Live inference hardening
 
 The CLI dashboard in `src/cli/` runs a live fleet simulator and
-displays AI predictions in real time. **Four pre-existing bugs in the
-streaming inference path silently degrade live dashboard predictions**
-and are documented in `src/cli/ai_bridge.py:load_models` and as fix
-`F1` in `REMAINING_FIXES.md`. The dashboard should be treated as a
-demonstration artifact, not an authoritative accuracy measurement —
-the batch pipeline metrics above are the ground truth.
+displays AI predictions in real time. End-to-end testing of the
+dashboard uncovered four defects that could either hide real bugs
+or produce operator-visible wrong behaviour:
+
+1. **Fleet Overview table never updated live** — `add_columns` was
+   called without keys, so every `update_cell` call raised
+   `CellDoesNotExist`, which was swallowed by a broad `except
+   Exception: pass`. Operators saw `—` placeholders for the entire
+   session. Fixed in commit `b541ebd` by adding explicit column
+   keys.
+2. **Scenario thermal effects polluted sibling miners** — all
+   miners of the same hardware model shared a single `MinerSpec`
+   object. Injecting `coolant_restriction` into one miner raised
+   the thermal resistance of every sibling of that model (and
+   mutated the global spec template). Fixed in commit `bcd3181` by
+   copying `MinerSpec` per-miner with `dataclasses.replace`.
+3. **Speed controls were inverted** — the tick-interval base was
+   `0.5s` at mount but `0.2/sim_speed` in the speed-up/down
+   handlers. Pressing `-` (slower) actually made the dashboard
+   faster. Fixed in commit `8980b0a` by unifying on a single
+   `BASE_TICK_INTERVAL = 0.5` constant.
+4. **Broad `except: pass` hid real bugs** — the exception handler
+   around the fleet-table update was the exact mechanism that let
+   bug #1 live undetected. Narrowed to `CellDoesNotExist` in
+   commit `ed35cc1`.
+
+All four defects have regression tests in
+`scripts/test_cli_dashboard_flaws.py`, runnable via
+`uv run python -m src.cli test-cli`. The test file intentionally
+lands with failing assertions (`0/4 passed`) in its first commit
+and the subsequent four commits turn them green one at a time,
+providing an auditable red-green-commit trail. See commits
+`d941911..ed35cc1` merged into `main` at `4ec5243`.
+
+Remaining broad-except blocks elsewhere in `src/cli/app.py` and
+`src/cli/ai_bridge.py` are tracked in `REMAINING_FIXES.md` (items
+F17-F19) and are scoped for post-submission hardening. The
+dashboard should still be treated as a demonstration artifact
+rather than an authoritative accuracy measurement — the batch
+pipeline metrics (§5.1-5.5) are the ground truth.
 
 ---
 
