@@ -21,6 +21,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual.widgets.data_table import CellDoesNotExist
 from textual.binding import Binding
 
 import numpy as np
@@ -344,7 +345,7 @@ class MiningDashboard(App):
                 table.update_cell(miner.miner_id, "Health", health_str)
                 table.update_cell(miner.miner_id, "Anomaly", anomaly_str)
                 table.update_cell(miner.miner_id, "Status", status_str)
-            except Exception:
+            except CellDoesNotExist:
                 pass
 
     # ── Alerts ────────────────────────────────────────────────────

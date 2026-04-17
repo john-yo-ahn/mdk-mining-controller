@@ -446,7 +446,7 @@ Expected: `FAIL test_flaw4_fleet_update_raises_not_swallowed: _update_fleet_tabl
 Near the other textual imports at the top of [src/cli/app.py](src/cli/app.py), add:
 
 ```python
-from textual.widgets._data_table import CellDoesNotExist
+from textual.widgets.data_table import CellDoesNotExist
 ```
 
 - [ ] **Step 3: Narrow the except**
@@ -576,6 +576,6 @@ Expected: 6 commits (scaffold + 4 fixes + subcommand wiring), each touching only
 
 - **Spec coverage:** each flaw from the user's report has a dedicated task (2, 3, 4, 5) plus scaffold (1) and wiring (6). ✓
 - **Placeholder scan:** no TBD/TODO/"handle appropriately" — every step shows the actual code or command. ✓
-- **Type consistency:** `BASE_TICK_INTERVAL` used identically in three call sites; `replace` import path stable; `CellDoesNotExist` imported from the one location Textual actually exposes it (`textual.widgets._data_table`). ✓
+- **Type consistency:** `BASE_TICK_INTERVAL` used identically in three call sites; `replace` import path stable; `CellDoesNotExist` imported from the documented public path (`textual.widgets.data_table`). ✓
 - **Test-first discipline:** every fix task begins with "confirm the failing test," ends with "confirm it passes + full harness." ✓
 - **Frequent commits:** one commit per fix, plus scaffold + wiring = 6 commits. ✓
