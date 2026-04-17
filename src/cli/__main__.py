@@ -8,6 +8,7 @@ Usage:
     mdk validate               # Run validation suite (~10 min)
     mdk check                  # Run consistency check (13 invariants)
     mdk test-te                # Run TE formula unit tests
+    mdk test-cli               # Run CLI dashboard regression tests (4 flaws)
     mdk test-lstm              # Run LSTM experiment harness (toy mode)
     mdk scenarios              # List failure scenarios
     mdk scenarios --detail     # Show full scenario specs
@@ -108,6 +109,11 @@ def cmd_test_te(args):
     sys.exit(run_te_tests())
 
 
+def cmd_test_cli(args):
+    from scripts.test_cli_dashboard_flaws import main as run_cli_tests
+    sys.exit(run_cli_tests())
+
+
 def cmd_test_lstm(args):
     from scripts.lstm_experiment_harness import run, MODES
     import json
@@ -144,6 +150,7 @@ def main():
 
     # Subcommand: test-te
     subparsers.add_parser("test-te", help="Run TE formula unit tests (10 tests)")
+    subparsers.add_parser("test-cli", help="Run CLI dashboard regression tests (4 flaws)")
 
     # Subcommand: test-lstm
     lstm_parser = subparsers.add_parser("test-lstm", help="Run LSTM experiment harness")
@@ -158,6 +165,7 @@ def main():
         "validate": cmd_validate,
         "check": cmd_check,
         "test-te": cmd_test_te,
+        "test-cli": cmd_test_cli,
         "test-lstm": cmd_test_lstm,
     }
 
