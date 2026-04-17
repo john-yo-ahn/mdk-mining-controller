@@ -35,8 +35,15 @@ Then run it yourself:
 
 ```bash
 uv sync
-uv run python -m src.run_pipeline       # ~50 min on Apple Silicon
-uv run python -m src.validate           # ~5 min, 4 validation tests
+
+# Fast green-path sanity (≈12 min total)
+uv run python -m src.cli test-te       # 10 KPI unit tests,         ~2s
+uv run python -m src.cli test-cli      # 4 dashboard regressions,   ~15s
+uv run python -m src.cli check         # 13 pipeline invariants,    ~11 min
+
+# Full end-to-end (≈1 h total)
+uv run python -m src.run_pipeline      # ~50 min on Apple Silicon
+uv run python -m src.validate          # ~9 min, 4 validation tests
 ```
 
 ## Assignment criteria → evidence map
