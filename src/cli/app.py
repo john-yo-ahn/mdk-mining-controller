@@ -209,11 +209,12 @@ class MiningDashboard(App):
         table = self.query_one("#fleet-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns(
+        for label in (
             "ID", "Model", "Container", "Mode",
             "Hashrate (TH/s)", "Power (W)", "Temp (C)",
             "J/TH", "TE Health", "Health", "Anomaly", "Status",
-        )
+        ):
+            table.add_column(label, key=label)
         for miner in self.sim.miners:
             table.add_row(
                 miner.miner_id, miner.spec.model[:16], miner.container_id,
