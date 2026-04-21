@@ -44,3 +44,7 @@ data/models/*
 
 # Agent coordinator scratch
 .claude/
+
+# Allow trained model weights (small, useful to ship)
+!data/models/lstm_ae.pt
+!data/models/xgboost_failure.joblib
