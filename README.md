@@ -60,15 +60,37 @@ to swap in real telemetry once a data sharing channel exists.
 # Install dependencies
 uv sync
 
-# Train models end to end (~1 hour first time, ~50 min after with cache hits)
-uv run python -m src.run_pipeline
+# Fast sanity tests — work on a fresh clone with no data (≈15 s)
+uv run python -m src.cli test-te       # 10/10 TE KPI unit tests
+uv run python -m src.cli test-cli      # 4/4 dashboard regressions
 
-# Launch the live dashboard
+# Launch the live dashboard (trained models ship with the repo)
 ./run_dashboard.sh
-
-# Run validation tests (hold-out failure types, AI-vs-threshold race, etc.)
-uv run python -m src.validate
 ```
+
+### Full reproducibility — two paths
+
+**Path A (fast, ~11 min):** download the companion dataset from HuggingFace and skip the 50-min pipeline rebuild.
+
+```bash
+uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('johnahn/mdk-mining-controller-data',
+                  repo_type='dataset', local_dir='data')
+"
+uv run python -m src.cli check         # 13/13 pipeline invariants, ~11 min
+uv run python -m src.cli validate      # 4/4 end-to-end tests,       ~9 min
+```
+
+**Path B (full, ~50 min):** regenerate everything deterministically from the seeded synthetic generator — no external downloads needed.
+
+```bash
+uv run python -m src.run_pipeline      # generate → preprocess → features → train
+uv run python -m src.cli check
+uv run python -m src.cli validate
+```
+
+**Companion dataset:** [huggingface.co/datasets/johnahn/mdk-mining-controller-data](https://huggingface.co/datasets/johnahn/mdk-mining-controller-data) — raw telemetry (158 MB), DuckDB (211 MB), and the 3.9 GB feature matrix that XGBoost/LSTM-AE train on. All files are reproducible from `src/synthetic/generator.py`; hosting them on HF lets reviewers skip the rebuild step. License: MIT, same as this repo.
 
 ## Reading order (for reviewers)
 
