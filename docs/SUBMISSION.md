@@ -34,17 +34,33 @@ Plus:
 Then run it yourself:
 
 ```bash
+git clone https://github.com/john-yo-ahn/mdk-mining-controller
+cd mdk-mining-controller
 uv sync
 
-# Fast green-path sanity (≈12 min total)
+# Fast green-path sanity (≈12 min total — works on a fresh clone with no data)
 uv run python -m src.cli test-te       # 10 KPI unit tests,         ~2s
 uv run python -m src.cli test-cli      # 4 dashboard regressions,   ~15s
-uv run python -m src.cli check         # 13 pipeline invariants,    ~11 min
 
-# Full end-to-end (≈1 h total)
-uv run python -m src.run_pipeline      # ~50 min on Apple Silicon
-uv run python -m src.validate          # ~9 min, 4 validation tests
+# To run `check` and `validate` (which need the synthetic dataset),
+# download the companion data from HuggingFace:
+uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('johnahn/mdk-mining-controller-data',
+                  repo_type='dataset', local_dir='data')
+"
+
+# Then verify end-to-end without retraining:
+uv run python -m src.cli check         # 13 pipeline invariants,    ~11 min
+uv run python -m src.cli validate      # 4 end-to-end tests,         ~9 min
+
+# Or regenerate everything from the seeded generator (≈50 min):
+uv run python -m src.run_pipeline
 ```
+
+**Artifacts:**
+- Code + trained models: https://github.com/john-yo-ahn/mdk-mining-controller
+- Synthetic dataset (4 GB): https://huggingface.co/datasets/johnahn/mdk-mining-controller-data
 
 ## Assignment criteria → evidence map
 
